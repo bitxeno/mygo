@@ -197,13 +197,17 @@ type WindowOptions struct {
 	Focusable      bool
 	Fullscreenable bool
 	AlwaysOnTop    bool
-	FullScreen     bool
-	Maximized      bool
-	SkipTaskbar    bool
-	AutoHideMenu   bool
-	HasShadow      bool
-	Frameless      bool
-	Transparent    bool
+	// NonActivating creates the window as a floating panel that never takes
+	// the focus from the frontmost application (macOS); other platforms
+	// ignore it.
+	NonActivating bool
+	FullScreen    bool
+	Maximized     bool
+	SkipTaskbar   bool
+	AutoHideMenu  bool
+	HasShadow     bool
+	Frameless     bool
+	Transparent   bool
 	// BackgroundColor is painted before the page renders; nil keeps the
 	// platform default.
 	BackgroundColor *Color

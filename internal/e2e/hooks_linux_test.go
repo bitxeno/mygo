@@ -242,3 +242,10 @@ func choosePopupItem(label string) (ok bool) {
 	mygo.RunOnMain(func() { ok = linux.TestChoosePopupItem(label) })
 	return ok
 }
+
+// Non-activating windows are macOS panels.
+func panelSemantics(*mygo.Window) (panel, key bool, supported bool) {
+	return false, false, false
+}
+
+func frontmostPID() int { return 0 }

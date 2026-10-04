@@ -100,3 +100,10 @@ func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+
+// Non-activating windows are macOS panels.
+func panelSemantics(*mygo.Window) (panel, key bool, supported bool) {
+	return false, false, false
+}
+
+func frontmostPID() int { return 0 }

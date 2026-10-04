@@ -109,6 +109,10 @@ func TestMain(m *testing.M) {
 		quitDuringDialog()
 		return
 	}
+	if os.Getenv("MYGO_E2E_PANEL") == "1" {
+		panelSubprocess()
+		return
+	}
 	if s := os.Getenv("MYGO_E2E_BEFORE_RUN"); s != "" {
 		beforeRun(mygo.ThemeSource(s))
 		return
@@ -192,6 +196,58 @@ func TestQuitDuringDialog(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		cmd.Process.Kill()
 		t.Fatalf("the app did not quit while a dialog was open; output %q", out.String())
+	}
+}
+
+// TestNonActivatingPanel drives a helper process that runs the app the way
+// a popup app does (accessory policy) and shows a non-activating panel: the
+// panel takes key status while the frontmost app stays frontmost.
+func TestNonActivatingPanel(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("non-activating panels are a macOS option")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "MYGO_E2E_PANEL=1")
+	b, err := cmd.CombinedOutput()
+	cancel()
+	out := string(b)
+	if err != nil {
+		t.Fatalf("%v:\n%s", err, out)
+	}
+	for _, want := range []string{"panel: visible=true\n", "panel: key=true\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in the output:\n%s", want, out)
+		}
+	}
+	m := regexp.MustCompile(`panel: frontmost=(\d+) self=(\d+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no frontmost line in the output:\n%s", out)
+	}
+	if m[1] == m[2] {
+		t.Errorf("showing the panel made the app frontmost:\n%s", out)
+	}
+}
+
+// panelSubprocess is the helper process of TestNonActivatingPanel.
+func panelSubprocess() {
+	mygo.App.SetActivationPolicy(mygo.ActivationPolicyAccessory)
+	mygo.App.WhenReady(func() {
+		go func() {
+			defer mygo.App.Quit()
+			w := mygo.NewWindow(mygo.WindowOptions{Width: 300, Height: 200, NonActivating: true, Hidden: true,
+				Content: ui.View(func(c *ui.Context) { ui.Text(c, "popup") })})
+			w.Show()
+			time.Sleep(500 * time.Millisecond)
+			panel, key, _ := panelSemantics(w)
+			fmt.Printf("panel: visible=%v\n", w.IsVisible())
+			fmt.Printf("panel: key=%v\n", panel && key)
+			fmt.Printf("panel: frontmost=%d self=%d\n", frontmostPID(), os.Getpid())
+		}()
+	})
+	if err := mygo.App.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 

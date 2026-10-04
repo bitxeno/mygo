@@ -119,6 +119,19 @@ type WindowOptions struct {
 	FullScreen        bool
 	// Maximized creates the window maximized.
 	Maximized bool
+	// NonActivating creates the window as a floating panel that never takes
+	// the focus from the frontmost application (macOS): showing it or
+	// clicking it leaves the frontmost app frontmost, while the window
+	// itself takes keyboard input. Launchers and clipboard popups summon
+	// one near the cursor, search in it, and paste into the app the user
+	// was working in. The window floats above other apps' windows like the
+	// menu bar, follows the summon to the active space, and never joins
+	// full screen; pair it with Hidden and show it on demand. Pair it with
+	// App options ActivationPolicyAccessory, as menu bar apps do: a regular
+	// app asks for activation once at launch, and showing any window
+	// completes that request and takes the focus after all. Ignored on
+	// Linux and Windows.
+	NonActivating bool
 	// SkipTaskbar hides the window from the taskbar (Linux, Windows).
 	SkipTaskbar bool
 	// AutoHideMenuBar keeps the window's menu bar out of sight until the
@@ -407,6 +420,7 @@ func (w *Window) platformOptions(o *WindowOptions) *platform.WindowOptions {
 		Focusable:      true,
 		Fullscreenable: !o.DisableFullScreen,
 		AlwaysOnTop:    o.AlwaysOnTop,
+		NonActivating:  o.NonActivating,
 		FullScreen:     o.FullScreen,
 		Maximized:      o.Maximized,
 		SkipTaskbar:    o.SkipTaskbar,

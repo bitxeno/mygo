@@ -2008,6 +2008,7 @@ which npm allows only for packages that exist: the first release uses an
 | skip taskbar | ignored | skip-taskbar hint | `ITaskbarList::DeleteTab` (the window style is untouched) |
 | FlashFrame | informational Dock bounce | urgency hint | `FlashWindowEx` until focused |
 | visible on all workspaces | `NSWindowCollectionBehaviorCanJoinAllSpaces` | `gtk_window_stick` | ignored |
+| non-activating window | `NSPanel` with the nonactivating style (`WindowOptions.NonActivating`): key on click without activating the app, floating at the screen-saver level | ignored | ignored |
 | window icon | ignored | `gtk_window_set_icon` | `WM_SETICON` at the window's DPI |
 | URL schemes | Info.plist (`urlSchemes`); `RegisterURLScheme` makes the app the default handler | desktop entry + `mimeapps.list` | `HKCU\Software\Classes` |
 | downloads | `shouldPerformDownload`, non-displayable or attachment responses → `WKDownload` delegate | `download-started` / `decide-destination` on the web context; response policy for attachments | `DownloadStarting` (`ICoreWebView2_4`), replacing WebView2's download UI |

@@ -21,16 +21,21 @@ const (
 	styleClosable            = 1 << 1
 	styleMiniaturizable      = 1 << 2
 	styleResizable           = 1 << 3
+	styleNonactivatingPanel  = 1 << 7
 	styleFullScreen          = 1 << 14
 	styleFullSizeContentView = 1 << 15
 
 	nsBackingStoreBuffered   = 2
 	nsFloatingWindowLevel    = 3
+	nsScreenSaverWindowLevel = 1000
 	nsNormalWindowLevel      = 0
 	nsViewWidthHeightSizable = 2 | 16
 
-	collectionFullScreenPrimary = 1 << 7
-	collectionFullScreenNone    = 1 << 9
+	collectionFullScreenPrimary   = 1 << 7
+	collectionFullScreenNone      = 1 << 9
+	collectionMoveToActiveSpace   = 1 << 1
+	collectionAuxiliary           = 1 << 17 // macOS 13; older systems ignore it
+	collectionFullScreenAuxiliary = 1 << 8
 
 	// NSApplicationPresentationOptions
 	presentationAutoHideMenuBar = 1 << 2
@@ -95,6 +100,11 @@ func (w *window) create() {
 	if hiddenTitleBar {
 		style |= styleFullSizeContentView
 	}
+	// The non-activating style only applies to NSPanel, so the window is
+	// allocated from the panel subclass when it is set.
+	if o.NonActivating {
+		style |= styleNonactivatingPanel
+	}
 
 	size := NSRect{Size: NSSize{float64(o.Width), float64(o.Height)}}
 	content := size
@@ -102,9 +112,20 @@ func (w *window) create() {
 		content = msgRectForRect(class("NSWindow"), sel("contentRectForFrameRect:styleMask:"), size, style)
 		content.Origin = NSPoint{}
 	}
-	w.win = msgInitWindow(send(class("MyGoWindow"), "alloc"), sel("initWithContentRect:styleMask:backing:defer:"),
+	cls := class("MyGoWindow")
+	if o.NonActivating {
+		cls = class("MyGoPanel")
+	}
+	w.win = msgInitWindow(send(cls, "alloc"), sel("initWithContentRect:styleMask:backing:defer:"),
 		content, style, nsBackingStoreBuffered, false)
 	send(w.win, "setReleasedWhenClosed:", 0)
+	if o.NonActivating {
+		// A floating, non-activating panel. AppKit's NSPanel defaults are
+		// deliberate here: the panel becomes key only when a text view
+		// needs it, so ordering it front does not activate the
+		// application.
+		send(w.win, "setHidesOnDeactivate:", 0)
+	}
 	w.delegate = alloc("MyGoWindowDelegate")
 	send(w.win, "setDelegate:", uintptr(w.delegate))
 	send(w.win, "setTitle:", uintptr(nsString(o.Title)))
@@ -136,10 +157,17 @@ func (w *window) create() {
 	if !o.Fullscreenable {
 		behavior = collectionFullScreenNone
 	}
-	send(w.win, "setCollectionBehavior:", uintptr(behavior))
-	if o.AlwaysOnTop {
+	if o.NonActivating {
+		// The popup's app is inactive, so the window level decides stacking
+		// against other apps' windows: the panel floats above them like the
+		// menu bar. It follows the summon to the active space and never
+		// joins full screen.
+		behavior = uint(collectionMoveToActiveSpace | collectionAuxiliary | collectionFullScreenAuxiliary)
+		send(w.win, "setLevel:", nsScreenSaverWindowLevel)
+	} else if o.AlwaysOnTop {
 		send(w.win, "setLevel:", nsFloatingWindowLevel)
 	}
+	send(w.win, "setCollectionBehavior:", uintptr(behavior))
 	send(w.win, "setHasShadow:", boolArg(o.HasShadow))
 	if o.Opacity < 1 {
 		msgSetFloat(w.win, sel("setAlphaValue:"), o.Opacity)
@@ -389,11 +417,17 @@ func (w *window) Show() {
 		send(w.parent.win, "beginSheet:completionHandler:", uintptr(w.win), 0)
 		return
 	}
+	// A non-activating panel takes key status without taking the session
+	// focus: the frontmost app stays frontmost and remains the paste
+	// target. The explicit activation below would take it, so panels skip
+	// it.
 	send(w.win, "makeKeyAndOrderFront:", 0)
 	if w.parent != nil && !w.parent.closed {
 		send(w.parent.win, "addChildWindow:ordered:", uintptr(w.win), 1)
 	}
-	send(w.b.app, "activateIgnoringOtherApps:", 1)
+	if !w.opts.NonActivating {
+		send(w.b.app, "activateIgnoringOtherApps:", 1)
+	}
 }
 
 func (w *window) ShowInactive() {
@@ -416,7 +450,11 @@ func (w *window) IsVisible() bool { return sendBool(w.win, "isVisible") }
 
 func (w *window) Focus() {
 	send(w.win, "makeKeyAndOrderFront:", 0)
-	send(w.b.app, "activateIgnoringOtherApps:", 1)
+	// See Show: a non-activating panel keys itself without activating the
+	// application.
+	if !w.opts.NonActivating {
+		send(w.b.app, "activateIgnoringOtherApps:", 1)
+	}
 }
 
 func (w *window) Blur()             { send(w.win, "orderBack:", 0) }
@@ -955,6 +993,14 @@ func registerWindowClasses() {
 	classDef("MyGoWindow", "NSWindow", nil, []objc.MethodDef{
 		method("canBecomeKeyWindow", func(self id, _ objc.SEL) bool { return true }),
 		method("canBecomeMainWindow", func(self id, _ objc.SEL) bool { return true }),
+	})
+
+	// MyGoPanel backs WindowOptions.NonActivating: it becomes the key
+	// window without activating the application, so the frontmost app keeps
+	// the focus and stays the paste target while the panel takes keyboard
+	// input.
+	classDef("MyGoPanel", "NSPanel", nil, []objc.MethodDef{
+		method("canBecomeKeyWindow", func(self id, _ objc.SEL) bool { return true }),
 	})
 
 	classDef("MyGoWebView", "WKWebView", nil, []objc.MethodDef{

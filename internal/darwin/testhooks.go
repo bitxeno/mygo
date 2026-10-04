@@ -182,6 +182,29 @@ func TestWebViewAttached(handle uintptr) bool {
 	return w != nil && send(w.web, "window") == w.win
 }
 
+// TestPanelSemantics reports whether the window is a non-activating panel
+// (the MyGoPanel NSPanel subclass carrying the nonactivating style) and
+// whether it is the key window.
+func TestPanelSemantics(handle uintptr) (panel, key bool) {
+	withPool(func() {
+		win := id(handle)
+		panel = uint(send(win, "styleMask"))&styleNonactivatingPanel != 0 &&
+			sendBool(win, "isMemberOfClass:", uintptr(class("MyGoPanel")))
+		key = sendBool(win, "isKeyWindow")
+	})
+	return panel, key
+}
+
+// TestFrontmostPID returns the process id of the frontmost application.
+func TestFrontmostPID() int {
+	pid := 0
+	withPool(func() {
+		ws := send(class("NSWorkspace"), "sharedWorkspace")
+		pid = sendInt(send(ws, "frontmostApplication"), "processIdentifier")
+	})
+	return pid
+}
+
 // TestDockInspector opens the web inspector of a window docked to it, and
 // reports whether the window has one.
 func TestDockInspector(handle uintptr) bool {

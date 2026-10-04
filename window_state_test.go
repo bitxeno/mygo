@@ -165,12 +165,15 @@ func TestFileDrop(t *testing.T) {
 }
 
 func TestWindowExtras(t *testing.T) {
-	w, fw := testWindow(t, WindowOptions{SkipTaskbar: true, AutoHideMenuBar: true})
+	w, fw := testWindow(t, WindowOptions{SkipTaskbar: true, AutoHideMenuBar: true, NonActivating: true})
 	if !fw.Opts.SkipTaskbar {
 		t.Error("SkipTaskbar option not passed")
 	}
 	if !fw.Opts.AutoHideMenu {
 		t.Error("AutoHideMenuBar option not passed")
+	}
+	if !fw.Opts.NonActivating {
+		t.Error("NonActivating option not passed")
 	}
 	for _, c := range []struct {
 		p     ProgressBar

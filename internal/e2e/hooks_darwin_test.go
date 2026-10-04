@@ -42,6 +42,16 @@ func webViewAttached(w *mygo.Window) (attached bool, supported bool) {
 	return attached, true
 }
 
+func panelSemantics(w *mygo.Window) (panel, key bool, supported bool) {
+	mygo.RunOnMain(func() { panel, key = darwin.TestPanelSemantics(w.NativeHandle()) })
+	return panel, key, true
+}
+
+func frontmostPID() (pid int) {
+	mygo.RunOnMain(func() { pid = darwin.TestFrontmostPID() })
+	return pid
+}
+
 func dockDevTools(w *mygo.Window) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestDockInspector(w.NativeHandle()) })
 	return ok
