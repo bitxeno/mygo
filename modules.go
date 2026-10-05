@@ -486,6 +486,17 @@ func (t *Tray) PopUpMenu() {
 	t.do(func(n platform.Tray) { n.PopUpMenu(snap) })
 }
 
+// PopUpMenuOf shows the given menu anchored to the icon without making it
+// the icon's menu: pair it with OnRightClick for a tray whose click is the
+// app's own (a menu set through TrayOptions or SetMenu takes the clicks).
+func (t *Tray) PopUpMenuOf(m *Menu) {
+	if m == nil {
+		return
+	}
+	snap := m.snapshot()
+	t.do(func(n platform.Tray) { n.PopUpMenu(snap) })
+}
+
 // Bounds returns the position of the icon on screen.
 func (t *Tray) Bounds() Rectangle {
 	return onMainValue(func() Rectangle {
