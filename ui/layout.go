@@ -426,6 +426,10 @@ func layoutBox(e *Element, w, h float32) {
 	switch e.kind {
 	case kindText:
 		e.tl = textSystem().Layout(e.textParams(max(cw, 1)))
+		if e.text == "X" || e.text == "截" {
+			tp := e.textParams(max(cw, 1))
+			println("DEBUG layout text:", e.text, "cw:", cw, "lines:", len(e.tl.Lines), "size:", tp.Style.Size, "textLen:", len(tp.Text))
+		}
 		if ed := e.st.editor; ed != nil && e.flags&flagSelectable != 0 {
 			// Selectable text hit-tests and selects in what it shows.
 			ed.layout = e.tl

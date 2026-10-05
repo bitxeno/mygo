@@ -88,6 +88,7 @@ const (
 	flagAbsolute
 	flagDisabled
 	flagTrackPointer
+	flagNoBars
 	flagPassThrough
 	flagDraggable
 	flagHover
@@ -804,6 +805,17 @@ func (e *Element) Shadow(x, y, blur, spread float32, c Color) *Element {
 }
 
 // Opacity makes the element and its children translucent.
+// ScrollBars shows or hides the scroll bars of a scroll container. Bars
+// show by default while the container is hovered or its thumb dragged.
+func (e *Element) ScrollBars(on bool) *Element {
+	if on {
+		e.flags &^= flagNoBars
+	} else {
+		e.flags |= flagNoBars
+	}
+	return e
+}
+
 func (e *Element) Opacity(o float32) *Element {
 	e.opacity, e.opacitySet = max(0, min(o, 1)), true
 	return e

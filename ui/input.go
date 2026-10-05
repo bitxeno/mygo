@@ -213,6 +213,9 @@ func (rt *engine) pointerDown(x, y float32, button int, mods Modifiers, count in
 		if s == nil {
 			continue
 		}
+		if y < 100 && len(chain) > 0 {
+			println("DEBUG chain: flags:", s.flags, "interactive:", s.flags&interactive != 0)
+		}
 		if target == nil && s.flags&interactive != 0 {
 			target = s
 		}
@@ -272,6 +275,9 @@ func (rt *engine) pointerDown(x, y float32, button int, mods Modifiers, count in
 		return
 	}
 	rt.pressed, rt.pressButton = target, button
+	if y < 120 {
+		println("DEBUG press target flags:", target.flags, "draggable:", target.flags&flagDraggable != 0, "x:", x, "y:", y)
+	}
 	target.pressed, target.pressMods = true, mods
 	target.pressX, target.pressY = x-target.x, y-target.y
 	if target.editor != nil {
@@ -906,7 +912,7 @@ func (e *Element) Submitted() bool { return e.st.submitted }
 func (rt *engine) scrollbarPress(chain []uint64, x, y float32) bool {
 	for _, id := range chain {
 		s := rt.states[id]
-		if s == nil || s.flags&(flagScrollX|flagScrollY) == 0 {
+		if s == nil || s.flags&(flagScrollX|flagScrollY) == 0 || s.flags&flagNoBars != 0 {
 			continue
 		}
 		g := scrollBars(Rect{s.x, s.y, s.w, s.h}, float32(s.contentW), float32(s.contentH), float32(s.scrollX), float32(s.scrollY), s.flags, rt.c.theme.scrollbarWidth())

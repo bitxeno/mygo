@@ -278,12 +278,16 @@ func (s *System) Baseline(y float32) float32 {
 
 func (s *System) rasterize(f *Font, id uint32, scale, dx float32, shade Shade, subpixel bool) GlyphImage {
 	b := s.engine().glyph(f, id, scale, dx, shade, subpixel)
+	if id == 0x58 || id == 0x6222 {
+		println("DEBUG rasterize id:", id, "w:", b.w, "h:", b.h, "color:", b.color)
+	}
 	if b.w <= 0 || b.h <= 0 || b.w > 2048 || b.h > 2048 {
 		return GlyphImage{}
 	}
 	inColor := b.color || b.subpixel
 	x, y, ok := s.alloc(inColor, b.w, b.h)
 	if !ok {
+		println("DEBUG atlas FULL for id:", id)
 		return GlyphImage{}
 	}
 	if inColor {
