@@ -390,9 +390,6 @@ func (p *Painter) debug(e *Element) {
 }
 
 func (p *Painter) pushClip(r Rect, radius [4]float32) {
-	if r.W <= 0 || r.H <= 0 || r.Y < -500 || r.X < -500 {
-		println("DEBUG pushClip SUSPECT: x:", r.X, "y:", r.Y, "w:", r.W, "h:", r.H)
-	}
 	p.clip = intersect(p.clip, r)
 	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpPushClip, Rect: p.snap(r), Radii: p.radii(radius)})
 }
@@ -408,9 +405,6 @@ func (p *Painter) textLayout(l *text.Layout, x, y float32, color Color, ts textS
 	if l == nil {
 		return
 	}
-	if color.A == 0 || p.opacity != 1 {
-		println("DEBUG textLayout SUSPECT: opacity:", p.opacity, "colorA:", color.A, "lines:", len(l.Lines))
-	}
 	sys := p.rt.text
 	s := p.scale
 	deco := decoration{underline: ts.underline, wavy: ts.wavy, strike: ts.strike, color: ts.decoColor, thick: ts.decoThick}
@@ -422,16 +416,8 @@ func (p *Painter) textLayout(l *text.Layout, x, y float32, color Color, ts textS
 		run = &p.rt.glyphRun
 		run.ids, run.pens, run.glyphs = run.ids[:0], run.pens[:0], run.glyphs[:0]
 	}
-	emptyLines, totalGlyphs := 0, 0
 	for li := range l.Lines {
 		line := &l.Lines[li]
-		totalGlyphs += len(line.Glyphs)
-		if len(line.Glyphs) == 0 {
-			emptyLines++
-		}
-		if len(line.Glyphs) > 0 && (x > 450 || x < -50) {
-			println("DEBUG textLayout origin: x:", x, "y:", y, "clipX:", p.clip.X, "clipW:", p.clip.W, "glyphs:", len(line.Glyphs))
-		}
 		if y+line.Y > p.clip.Y+p.clip.H || y+line.Y+line.Height < p.clip.Y {
 			continue
 		}
@@ -481,9 +467,6 @@ func (p *Painter) textLayout(l *text.Layout, x, y float32, color Color, ts textS
 	}
 	if end := int32(len(p.s.Glyphs)); end > start {
 		p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpGlyphs, Start: start, End: end})
-	}
-	if totalGlyphs == 0 && emptyLines > 0 {
-		println("DEBUG textLayout EMPTY:", string(l.Runes), "width:", l.Width, "paramsW:", l.Params.Width)
 	}
 }
 

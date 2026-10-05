@@ -815,9 +815,6 @@ func (e *coreText) fontOf(font uintptr) *Font {
 
 func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, rtl, wholeWords bool) []shapedLine {
 	font := e.ctFont(style)
-	if len(text) > 0 && (text[0] == 'X' || text[0] == '截') && len(text) < 12 {
-		println("DEBUG shape: first:", string(text[0]), "len:", len(text), "size:", style.Size, "font:", font)
-	}
 	if font == 0 || len(text) == 0 {
 		return nil
 	}
@@ -893,15 +890,6 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 		lines = e.addLine(mark, e.line(line, index, n))
 		ct.release(line)
 		start += count
-	}
-	if len(text) > 0 && (text[0] == 'X' || text[0] == '截' || text[0] == 'M') && len(text) < 14 {
-		total := 0
-		for _, l := range lines {
-			for _, r := range l.runs {
-				total += len(r.glyphs)
-			}
-		}
-		println("DEBUG shape out:", string(text[:min(4, len(text))]), "lines:", len(lines), "glyphs:", total, "width:", width)
 	}
 	return lines
 }

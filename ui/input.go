@@ -213,9 +213,6 @@ func (rt *engine) pointerDown(x, y float32, button int, mods Modifiers, count in
 		if s == nil {
 			continue
 		}
-		if y < 100 && len(chain) > 0 {
-			println("DEBUG chain: flags:", s.flags, "interactive:", s.flags&interactive != 0)
-		}
 		if target == nil && s.flags&interactive != 0 {
 			target = s
 		}
@@ -275,9 +272,6 @@ func (rt *engine) pointerDown(x, y float32, button int, mods Modifiers, count in
 		return
 	}
 	rt.pressed, rt.pressButton = target, button
-	if y < 120 {
-		println("DEBUG press target flags:", target.flags, "draggable:", target.flags&flagDraggable != 0, "x:", x, "y:", y)
-	}
 	target.pressed, target.pressMods = true, mods
 	target.pressX, target.pressY = x-target.x, y-target.y
 	if target.editor != nil {
