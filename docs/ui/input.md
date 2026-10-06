@@ -24,6 +24,23 @@ pointer through to what is below.
 Elements that take the pointer give it to the innermost under it: a button
 in a clickable row takes its own clicks.
 
+While the pointer presses an element, the elements it was over as the
+press began, as the row around a button, stay `Hovered` as long as it is
+over them, as in CSS, and the others hover no more: dragging over other
+elements does not light them up. A button that shows while its row is
+hovered stays as it is pressed, to take its click:
+
+```go
+row := ui.Row(c).Padding(8)
+hovered := row.Hovered()
+row.Children(func() {
+	ui.Text(c, item.Title).Grow(1)
+	if hovered && ui.Button(c, "Remove").Clicked() {
+		removed = item.ID
+	}
+})
+```
+
 ## The keyboard focus
 
 `Focusable` elements take the focus when clicked, and Tab and Shift+Tab
@@ -119,7 +136,10 @@ shortcuts, Tab, context menus and scroll containers as usual, and keys that
 the window or an element around the focus handles with `Shortcut` go there
 first. `TextCaret` turns on the system's input methods for such an element
 while it has the focus, composing at the caret it gives. `c.ReadClipboard`,
-`c.WriteClipboard` and `c.OpenURL` copy, paste and open links for them:
+`c.WriteClipboard` and `c.OpenURL` copy, paste and open links for them;
+`c.OpenURLThen` opens a link too, and its function gets what came of it a
+moment later, as the system opens it, with an error when no app could,
+and the view builds a frame anew:
 
 ```go
 ui.Box(c).Fill().Focusable().HandleInput(func(ev ui.InputEvent) bool {
@@ -132,6 +152,12 @@ ui.Box(c).Fill().Focusable().HandleInput(func(ev ui.InputEvent) bool {
 	}
 	return false
 }).TextCaret(app.caretRect())
+
+c.OpenURLThen(url, func(err error) {
+	if err != nil {
+		c.Toast("No app opens " + url)
+	}
+})
 ```
 
 ## See also

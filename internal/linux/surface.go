@@ -3,7 +3,9 @@
 package linux
 
 import (
+	"image"
 	"log"
+	"math"
 	"os"
 	"sync"
 	"unicode/utf8"
@@ -19,8 +21,17 @@ import (
 // render signal, into the framebuffer of the context GTK makes current,
 // and GTK shows them. Without OpenGL, frames drawn in memory are painted
 // with cairo in the draw signal, as on a GtkDrawingArea, which the surface
-// is with MYGO_GPU=0. GTK's frame clock paces both; keys go through a
-// GtkIMContext while a text input has the focus.
+// is with MYGO_GPU=0 and without a GPU. A GtkGLArea makes no context until
+// the content asks for the GPU (UseGPU), as making one loads the driver
+// for good, some 50 MB: until then it paints frames drawn in memory too,
+// and GTK paints the window without OpenGL. GTK's frame clock paces both;
+// keys go through a GtkIMContext while a text input has the focus.
+//
+// Frames drawn in memory are drawn in the frame clock's update phase, by a
+// tick callback, before GTK paints: the area then asks GTK to repaint what
+// they changed, which GTK paints from them, keeping the rest of its buffer
+// and telling the compositor only that changed. A draw GTK asks for by
+// itself, as when the window is resized or uncovered, draws a frame there.
 
 var (
 	surfaceOnce                 sync.Once
@@ -28,11 +39,21 @@ var (
 	gtkWidgetSetCanFocus        func(w ptr, v bool)
 	gtkWidgetAddEvents          func(w ptr, mask int32)
 	gtkWidgetQueueDraw          func(w ptr)
+	gtkWidgetQueueDrawArea      func(w ptr, x, y, width, height int32)
+	gtkWidgetGetHasWindow       func(w ptr) bool
+	gtkWidgetAddTickCallback    func(w, callback, data, notify ptr) uint32
+	cairoClipExtents            func(cr ptr, x1, y1, x2, y2 *float64)
 	gtkWidgetGetAllocatedWidth  func(w ptr) int32
 	gtkWidgetGetAllocatedHeight func(w ptr) int32
 	gtkWidgetGetScaleFactor     func(w ptr) int32
 	gtkWidgetGetDisplay         func(w ptr) ptr
 	gtkWidgetHasFocus           func(w ptr) bool
+	gtkWidgetGetRealized        func(w ptr) bool
+	gtkWidgetGetMapped          func(w ptr) bool
+	gtkWidgetUnrealize          func(w ptr)
+	gtkWidgetMap                func(w ptr)
+	gdkWindowLower              func(w ptr)
+	gSignalStopEmissionByName   func(obj ptr, signal *byte)
 	gtkIMMulticontextNew        func() ptr
 	gtkIMContextSetClientWindow func(im, win ptr)
 	gtkIMContextFilterKeypress  func(im, event ptr) bool
@@ -59,7 +80,7 @@ var (
 	cbSurfaceMotion, cbSurfaceLeave, cbSurfaceScroll, cbSurfaceKey  ptr
 	cbSurfaceFocusIn, cbSurfaceFocusOut, cbSurfaceScale, cbIMCommit ptr
 	cbIMPreedit, cbIMPreeditEnd, cbSurfaceRender, cbAreaContext     ptr
-	cbSurfaceUnrealize                                              ptr
+	cbSurfaceUnrealize, cbSurfaceTick                               ptr
 	surfaceCursors                                                  = map[platform.Cursor]ptr{}
 )
 
@@ -70,11 +91,21 @@ func loadSurface() {
 		mustBind(t, &gtkWidgetSetCanFocus, "gtk_widget_set_can_focus")
 		mustBind(t, &gtkWidgetAddEvents, "gtk_widget_add_events")
 		mustBind(t, &gtkWidgetQueueDraw, "gtk_widget_queue_draw")
+		mustBind(t, &gtkWidgetQueueDrawArea, "gtk_widget_queue_draw_area")
+		mustBind(t, &gtkWidgetGetHasWindow, "gtk_widget_get_has_window")
+		mustBind(t, &gtkWidgetAddTickCallback, "gtk_widget_add_tick_callback")
+		mustBind(c, &cairoClipExtents, "cairo_clip_extents")
 		mustBind(t, &gtkWidgetGetAllocatedWidth, "gtk_widget_get_allocated_width")
 		mustBind(t, &gtkWidgetGetAllocatedHeight, "gtk_widget_get_allocated_height")
 		mustBind(t, &gtkWidgetGetScaleFactor, "gtk_widget_get_scale_factor")
 		mustBind(t, &gtkWidgetGetDisplay, "gtk_widget_get_display")
 		mustBind(t, &gtkWidgetHasFocus, "gtk_widget_has_focus")
+		mustBind(t, &gtkWidgetGetRealized, "gtk_widget_get_realized")
+		mustBind(t, &gtkWidgetGetMapped, "gtk_widget_get_mapped")
+		mustBind(t, &gtkWidgetUnrealize, "gtk_widget_unrealize")
+		mustBind(t, &gtkWidgetMap, "gtk_widget_map")
+		mustBind(d, &gdkWindowLower, "gdk_window_lower")
+		mustBind(libGObject, &gSignalStopEmissionByName, "g_signal_stop_emission_by_name")
 		mustBind(t, &gtkIMMulticontextNew, "gtk_im_multicontext_new")
 		mustBind(t, &gtkIMContextSetClientWindow, "gtk_im_context_set_client_window")
 		mustBind(t, &gtkIMContextFilterKeypress, "gtk_im_context_filter_keypress")
@@ -106,14 +137,27 @@ type surface struct {
 	im     ptr // GtkIMContext
 	cr     ptr // the cairo context of the draw signal in progress
 	cursor platform.Cursor
-	// gl tells that the area is a GtkGLArea, rendering that its render
-	// signal is in progress, rendered that it ran.
-	gl, rendering, rendered bool
+	// gl tells that the area is a GtkGLArea, lazy that it makes no
+	// context until UseGPU, rendering that its render signal is in
+	// progress, rendered that it ran.
+	gl, lazy, rendering, rendered bool
 	// present shows the frames the content draws in memory in a GtkGLArea,
 	// as when its GL renderer fails; inMemory tells that it did, failed
 	// that it failed too.
 	present                 gl.Presenter
 	inMemory, presentFailed bool
+	// tick is the tick callback drawing frames in memory, while one is
+	// asked for (RequestFrame); again tells that another was asked for
+	// while it drew one, and ticking that it draws one.
+	tick           uint32
+	again, ticking bool
+	// staged is the frame the tick callback drew, which the draw signal
+	// paints in the same frame of the frame clock: the host's memory,
+	// valid until it draws or frees another (see Idle and UseGPU).
+	staged struct {
+		pix                   []byte
+		stride, width, height int
+	}
 
 	textInput bool
 	caret     platform.RectF
@@ -131,7 +175,11 @@ func (w *window) createSurface() {
 	data := ptr(w.id)
 	s := &surface{w: w}
 	s.im = gtkIMMulticontextNew()
-	s.newArea(gtkGLAreaNew != nil && os.Getenv("MYGO_GPU") != "0" && gpuGL())
+	// MYGO_GPU=1 draws with OpenGL from the first frame, wherever GDK
+	// makes a context.
+	now := os.Getenv("MYGO_GPU") == "1" && !testLazyGL
+	s.newArea(gtkGLAreaNew != nil && os.Getenv("MYGO_GPU") != "0" && (now || testLazyGL || hasGPUDevice()))
+	s.lazy = s.gl && !now
 	connect(s.im, "commit", cbIMCommit, data)
 	connect(s.im, "preedit-changed", cbIMPreedit, data)
 	connect(s.im, "preedit-end", cbIMPreeditEnd, data)
@@ -262,8 +310,105 @@ func (s *surface) Size() (float64, float64, float64) {
 }
 
 func (s *surface) RequestFrame() {
-	if !s.w.closed {
+	switch {
+	case s.w.closed:
+	case s.drawsGL():
 		gtkWidgetQueueDraw(s.area)
+	default:
+		s.again = true
+		if s.tick == 0 {
+			s.tick = gtkWidgetAddTickCallback(s.area, cbSurfaceTick, ptr(s.w.id), 0)
+		}
+	}
+}
+
+// drawsGL tells that the area draws its frames with OpenGL, in its render
+// signal: a GtkGLArea with a context.
+func (s *surface) drawsGL() bool { return s.gl && gtkGLAreaGetError(s.area) == 0 }
+
+// PresentDamage shows a frame drawn in memory that changed the last one
+// only within damage. Drawn by the tick callback, it is painted where GTK
+// repaints what changed; in the draw signal or the render signal, it is
+// painted whole, and what it changed outside GTK's clip is repainted in
+// the next frame.
+func (s *surface) PresentDamage(pix []byte, stride, width, height int, damage []image.Rectangle) {
+	scale := max(int(gtkWidgetGetScaleFactor(s.area)), 1)
+	// GTK takes the area to repaint in the coordinates of the widget's
+	// GdkWindow, whatever its documentation says: a GtkGLArea has none of
+	// its own, and its parent's starts above and left of it, by the title
+	// bar GTK draws, its shadow, or the menu bar.
+	var at gdkRectangle
+	if !gtkWidgetGetHasWindow(s.area) {
+		gtkWidgetGetAllocation(s.area, &at)
+	}
+	queue := func(d image.Rectangle) {
+		x0, y0 := d.Min.X/scale, d.Min.Y/scale
+		gtkWidgetQueueDrawArea(s.area, at.X+int32(x0), at.Y+int32(y0), int32((d.Max.X+scale-1)/scale-x0), int32((d.Max.Y+scale-1)/scale-y0))
+	}
+	if !s.ticking {
+		s.PresentPixels(pix, stride, width, height)
+		if s.cr != 0 {
+			var x0, y0, x1, y1 float64
+			cairoClipExtents(s.cr, &x0, &y0, &x1, &y1)
+			clip := image.Rect(int(math.Floor(x0))*scale, int(math.Floor(y0))*scale, int(math.Ceil(x1))*scale, int(math.Ceil(y1))*scale)
+			for _, d := range damage {
+				if !d.In(clip) {
+					queue(d)
+				}
+			}
+		}
+		return
+	}
+	s.staged.pix, s.staged.stride, s.staged.width, s.staged.height = pix, stride, width, height
+	for _, d := range damage {
+		queue(d)
+	}
+}
+
+// UseGPU gives the GtkGLArea its OpenGL context, where OpenGL draws on a
+// GPU, and reports whether it did. GtkGLArea makes it as it is realized,
+// so the area is realized anew. Without a GPU it stays without one.
+func (s *surface) UseGPU() bool {
+	if !s.lazy || s.w.closed || !gpuGL() {
+		return false
+	}
+	s.lazy = false
+	s.staged.pix = nil // the host frees it
+	if gtkWidgetGetRealized(s.area) {
+		// Input methods follow the input window, which realizing makes anew.
+		focused, mapped := gtkWidgetHasFocus(s.area), gtkWidgetGetMapped(s.area)
+		if focused {
+			gtkIMContextFocusOut(s.im)
+		}
+		gtkWidgetUnrealize(s.area)
+		gtkWidgetRealize(s.area)
+		if mapped {
+			gtkWidgetMap(s.area)
+		}
+		// Mapped, the new input window went over its siblings, as the
+		// windows of a hidden title bar's controls: they take the pointer.
+		if win := s.eventWindow(); win != gtkWidgetGetWindow(s.area) {
+			gdkWindowLower(win)
+		}
+		if focused {
+			gtkIMContextFocusIn(s.im)
+		}
+	}
+	gtkWidgetQueueDraw(s.area)
+	return gtkGLAreaGetError(s.area) == 0
+}
+
+// mallocTrim is glibc's malloc_trim, which other C libraries lack.
+var mallocTrim, _ = purego.Dlsym(purego.RTLD_DEFAULT, "malloc_trim")
+
+// Idle gives the system back the memory that C code freed while drawing
+// frames, which glibc keeps for later: GTK paints a window it composites
+// with OpenGL into an image as large as the window each frame, and glibc
+// raises its threshold for giving large blocks back as they are freed.
+func (s *surface) Idle() {
+	s.staged.pix = nil // the host freed it
+	if mallocTrim != 0 {
+		purego.SyscallN(mallocTrim, 0)
 	}
 }
 
@@ -417,17 +562,55 @@ func initSurfaceCallbacks() {
 		}
 		// A GtkGLArea draws in its render signal, unless it has no context:
 		// then, as a drawing area, in this one.
-		if s.gl && gtkGLAreaGetError(s.area) == 0 {
+		if s.drawsGL() {
 			return false
 		}
 		s.cr = cr
-		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+		// The frame the tick callback drew, unless GTK resized the area
+		// since; else GTK asked for this draw by itself, and the content
+		// draws a frame now.
+		st := &s.staged
+		w, h, scale := s.Size()
+		if st.pix != nil && st.width == int(math.Ceil(w*scale)) && st.height == int(math.Ceil(h*scale)) {
+			s.PresentPixels(st.pix, st.stride, st.width, st.height)
+		} else {
+			s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+		}
+		st.pix = nil
 		s.cr = 0
 		return true
 	})
+	// The tick callback draws the frames asked for in memory, before GTK
+	// paints, as long as they are asked for.
+	cbSurfaceTick = purego.NewCallback(func(widget, clock, data ptr) bool {
+		s := b().surfaceOf(data)
+		if s == nil {
+			return false
+		}
+		if s.drawsGL() {
+			// The area has its context now: frames come from its render
+			// signal.
+			s.tick = 0
+			gtkWidgetQueueDraw(s.area)
+			return false
+		}
+		s.again, s.ticking, s.staged.pix = false, true, nil
+		s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame})
+		s.ticking = false
+		if !s.again {
+			s.tick = 0
+		}
+		return s.again
+	})
 	// The GtkGLArea's context: OpenGL 3.3, else OpenGL ES 3.0. One GDK
-	// cannot make leaves the area its error, so that it draws with cairo.
+	// cannot make leaves the area its error, so that it draws with cairo,
+	// as does the area until UseGPU, without the context GTK's own handler
+	// would make.
 	cbAreaContext = purego.NewCallback(func(area, data ptr) ptr {
+		if s := b().surfaceOf(data); s != nil && s.lazy {
+			gSignalStopEmissionByName(area, cs("create-context"))
+			return 0
+		}
 		ctx, gerr := glContext(gtkWidgetGetWindow(area))
 		if gerr != 0 {
 			gtkGLAreaSetError(area, gerr)

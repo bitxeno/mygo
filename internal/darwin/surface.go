@@ -232,6 +232,11 @@ func (s *surface) RequestFrame() {
 	})
 }
 
+// Occluded reports whether nothing of the window shows on screen: hidden,
+// minimized, on another space or covered by other windows, which still
+// get display link ticks.
+func (s *surface) Occluded() bool { return !s.visible() }
+
 // visible reports whether some of the window shows on screen.
 func (s *surface) visible() bool {
 	const occlusionStateVisible = 1 << 1
@@ -254,6 +259,14 @@ func (s *surface) RefreshRate() float64 {
 		return float64(sendInt(screen, "maximumFramesPerSecond"))
 	}
 	return 0
+}
+
+// WideGamut reports whether the window's screen shows Display P3's colors,
+// outside the sRGB gamut, as the screens of recent Macs do.
+func (s *surface) WideGamut() bool {
+	const displayGamutP3 = 2 // NSDisplayGamutP3
+	screen := send(s.w.win, "screen")
+	return screen != 0 && respondsTo(screen, "canRepresentDisplayGamut:") && byte(send(screen, "canRepresentDisplayGamut:", displayGamutP3)) != 0
 }
 
 func (s *surface) PresentPixels(pix []byte, stride, width, height int) {
@@ -590,12 +603,16 @@ func registerSurfaceClass() {
 			if s == nil {
 				return
 			}
-			if s.framePass == caPass {
+			if s.framePass == caPass && send(self, "inLiveResize") == 0 {
 				// AppKit displays the view again before Core Animation
 				// commits the frame drawn in this pass, as while the
 				// trackpad scrolls: the frame would wait a second for a
 				// drawable, the layer's two being taken until the commit.
 				// The next refresh draws it: as one just drew, not at once.
+				// A window that resizes, as zooming animates it, displays
+				// the view for each of its sizes within one pass of the
+				// run loop, committing each: those frames draw at once, or
+				// the layer would stretch the last one to the new sizes.
 				s.lastFrame = time.Now()
 				s.RequestFrame()
 				return
@@ -625,7 +642,7 @@ func registerSurfaceClass() {
 			}
 		}),
 		method("setFrameSize:", func(self id, cmd objc.SEL, size NSSize) {
-			objc.ID(self).SendSuper(cmd, size)
+			sendSuperSize(self, "MyGoSurfaceView", cmd, size)
 			if s := b().surfaceOf(self); s != nil {
 				s.send(platform.SurfaceEvent{Kind: platform.SurfaceResize})
 				send(self, "setNeedsDisplay:", 1)
@@ -696,10 +713,17 @@ func registerSurfaceClass() {
 				return
 			}
 			mods := eventMods(ev)
-			s.send(platform.SurfaceEvent{Kind: platform.KeyPressed, Key: eventKey(ev), Mods: mods, Repeat: sendBool(ev, "isARepeat")})
+			ime := s.input.Active && mods&(platform.ModSuper|platform.ModCtrl) == 0
+			// A key typed while the input method composes is the input
+			// method's alone, as Enter choosing a candidate or Escape
+			// giving the composition up, as GTK's and IMM32's filtering
+			// keeps them on Linux and Windows.
+			if !ime || s.marked == "" {
+				s.send(platform.SurfaceEvent{Kind: platform.KeyPressed, Key: eventKey(ev), Mods: mods, Repeat: sendBool(ev, "isARepeat")})
+			}
 			// Input methods see the key while a text input has the focus;
 			// they answer with insertText: or setMarkedText:.
-			if s.input.Active && mods&(platform.ModSuper|platform.ModCtrl) == 0 {
+			if ime {
 				s.keyDown = true
 				send(self, "interpretKeyEvents:", uintptr(nsArray(ev)))
 				s.keyDown = false

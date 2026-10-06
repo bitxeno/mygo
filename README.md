@@ -1,6 +1,8 @@
-# MyGo
+<p align="center">
+<img width="800" height="360" alt="MyGo!!!!!" src="https://github.com/user-attachments/assets/c3eee9bc-5f22-4032-95b6-776e8381910a" />
+</p>
 
-Desktop apps in Go, with a web frontend or a native UI.
+**Desktop apps in Go, with a web frontend or a native UI.**
 
 Each MyGo window shows one of two kinds of interface, and one app can mix
 them:
@@ -21,7 +23,8 @@ memory and CPU use.
   code.
 - **A Go UI toolkit** for native UI: flexbox and grid layout, widgets, text
   editing with input methods, virtualized lists, SVG icons, animations,
-  screen reader support, and views you test without a window.
+  screen reader support, and views you test without a window; Liquid Glass
+  on every platform with the glass plugin.
 - **Desktop APIs** for both: windows, menus, tray, dialogs, notifications,
   global shortcuts, deep links, file associations and more.
 - **Ready to ship**: app bundles and disk images, Windows installers, Debian

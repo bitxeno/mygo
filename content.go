@@ -52,9 +52,29 @@ func (w *Window) attachContent() {
 			}
 			return w.native.TitleBar()
 		},
-		OpenURL:    func(url string) { go Shell.OpenExternal(url) },
+		OpenURL: func(url string, done func(error)) {
+			// The system may take a while, as Windows' shell does: not
+			// in the frame.
+			go func() {
+				err := Shell.OpenExternal(url)
+				if done != nil {
+					postMain(func() {
+						if w.native != nil {
+							done(err)
+						}
+					})
+				}
+			}()
+		},
 		DevTools:   w.devTools,
 		Invalidate: w.Invalidate,
+		Post: func(fn func()) {
+			postMain(func() {
+				if w.native != nil {
+					fn()
+				}
+			})
+		},
 		PopupMenu: func(m *platform.Menu, x, y float64, chosen func(int)) {
 			pos := &platform.Point{X: int(math.Round(x)), Y: int(math.Round(y))}
 			menu := NewMenu(contentMenu(m, chosen))
@@ -124,9 +144,7 @@ func (w *Window) Invalidate() {
 	}
 	postMain(func() {
 		w.invalidating.Store(false)
-		if w.conn != nil && w.native != nil {
-			w.conn.Surface.RequestFrame()
-		}
+		w.contentChanged()
 	})
 }
 
@@ -143,10 +161,20 @@ func (w *Window) Invalidate() {
 func (w *Window) Update(fn func()) {
 	postMain(func() {
 		fn()
-		if w.conn != nil && w.native != nil {
-			w.conn.Surface.RequestFrame()
-		}
+		w.contentChanged()
 	})
+}
+
+// contentChanged asks the Content for a frame built anew, on the main
+// thread, after the app changed its state.
+func (w *Window) contentChanged() {
+	switch {
+	case w.conn == nil || w.native == nil:
+	case w.conn.Changed != nil:
+		w.conn.Changed()
+	default:
+		w.conn.Surface.RequestFrame()
+	}
 }
 
 // captureContent renders the Content into a PNG image.

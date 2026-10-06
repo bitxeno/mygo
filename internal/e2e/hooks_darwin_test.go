@@ -124,8 +124,18 @@ func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return
 func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
 func loseComposition(bool) bool                   { return false }
 
+// WebKit creates web views with their windows.
+func failWebViews(int) bool { return false }
+
 func clickAndType(w *mygo.Window, x, y float64, text string) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestClickAndType(w.NativeHandle(), x, y, text) })
+	return ok
+}
+
+// pressKey presses the key of a virtual key code in a window of native UI,
+// through the input method.
+func pressKey(w *mygo.Window, code uint16, chars string) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestKey(w.NativeHandle(), code, chars) })
 	return ok
 }
 
@@ -173,13 +183,33 @@ func accessibility(w *mygo.Window) (nodes []accessNode, ok bool) {
 	return nodes, true
 }
 
+// axAttribute reads an attribute of an element through AppKit's older
+// accessibility API, which only macOS has.
+func axAttribute(w *mygo.Window, label, attr string) (value string, settable, named, ok bool) {
+	mygo.RunOnMain(func() { value, settable, named, ok = darwin.TestAccessibilityAttribute(w.NativeHandle(), label, attr) })
+	return value, settable, named, ok
+}
+
 func accessPerform(w *mygo.Window, label, action, value string) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestAccessibilityPerform(w.NativeHandle(), label, action, value) })
 	return ok
 }
 
-// Only Linux draws native UI in a GtkGLArea.
+// observe has key-value observing watch the view of a window showing
+// native UI and its elements, until stop.
+func observe(w *mygo.Window) (stop func(), supported bool) {
+	var end func()
+	mygo.RunOnMain(func() { end = darwin.TestObserve(w.NativeHandle()) })
+	return func() { mygo.RunOnMain(end) }, true
+}
+
+// Only Linux draws native UI in a GtkGLArea, nor waits to load the GPU's
+// driver.
 func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 0, 0, false }
+func lazyGPU(bool) bool                                       { return false }
+func useGPU(*mygo.Window) bool                                { return false }
+func surfaceInputLowest(*mygo.Window) bool                    { return true }
+func surfaceOnScreen(*mygo.Window) ([]byte, bool)             { return nil, false }
 
 // Context menus are not automated on macOS: one shown waits for the user.
 func rightClick(*mygo.Window, float64, float64) bool { return false }

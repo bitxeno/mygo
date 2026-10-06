@@ -2,6 +2,8 @@ package ui
 
 import (
 	"math"
+	"runtime"
+	"time"
 
 	"github.com/egoist/mygo/internal/scene"
 	"github.com/egoist/mygo/internal/text"
@@ -19,6 +21,11 @@ type Painter struct {
 	// subpixel glyphs need.
 	opaque bool
 }
+
+// continuousCorners curves rounded corners as Apple does, on macOS, where
+// AppKit's and SwiftUI's controls have them (scene.Op.Continuous): circular
+// elsewhere, as Windows and GTK draw them.
+const continuousCorners = runtime.GOOS == "darwin"
 
 func (rt *engine) paint(root *Element, w, h, scale float32) {
 	s := &rt.scene
@@ -39,6 +46,30 @@ func (rt *engine) paint(root *Element, w, h, scale float32) {
 		rt.insp.paintHighlight(rt, p, h)
 	}
 	rt.paintDrag(p, w, h)
+}
+
+// Now returns the time of the frame being painted, which drawings that
+// move compute from.
+func (p *Painter) Now() time.Time { return p.rt.c.now }
+
+// AnimationFrame asks for the element to be painted again as soon as the
+// display can show it, for a drawing that moves with Now while the layout
+// stays, as a spinner's: unless something else changed meanwhile, the next
+// frame paints the elements of this one again without building the view.
+// Call it in every frame while the drawing moves; an element out of view
+// is not painted, so it asks for none.
+func (p *Painter) AnimationFrame() { p.rt.repainting = true }
+
+// After asks for the element to be painted again after d, for a drawing
+// that changes then, as a spinner's next step: unless something else
+// changed meanwhile, that frame paints the elements of this one again
+// without building the view. An element out of view is not painted, so
+// it asks for none.
+func (p *Painter) After(d time.Duration) {
+	at := p.rt.c.now.Add(d)
+	if p.rt.repaintAt.IsZero() || at.Before(p.rt.repaintAt) {
+		p.rt.repaintAt = at
+	}
 }
 
 // snap converts a rectangle to device pixels, rounding its edges to whole
@@ -216,10 +247,13 @@ func (p *Painter) borders(w [4]float32) [4]float32 {
 
 // fill paints a rounded rectangle with a solid border of bw DIPs.
 func (p *Painter) fill(r Rect, radius [4]float32, bg Color, bw float32, bc Color) {
-	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii(radius), Color: bg.scene(), BorderColor: bc.scene(), Opacity: p.opacity}
+	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii(radius), Continuous: continuousCorners, Color: bg.scene(), BorderColor: bc.scene(), Opacity: p.opacity}
+	var drawn Color // the border's, if any
 	if bw > 0 {
 		op.Border = p.borders([4]float32{bw, bw, bw, bw})
+		drawn = bc
 	}
+	op.Wide = p.wide(bg, Color{}, drawn)
 	p.s.Ops = append(p.s.Ops, op)
 }
 
@@ -227,6 +261,13 @@ func (p *Painter) fill(r Rect, radius [4]float32, bg Color, bw float32, bc Color
 // unless withBorder is false.
 func (p *Painter) background(e *Element, box Rect, withBorder bool) {
 	border := withBorder && scene.HasBorder(e.border) && e.borderC.A > 0
+	if e.fill == fillMaterial {
+		e.material.PaintMaterial(p, box, e.radius)
+		if border {
+			p.border(e, box)
+		}
+		return
+	}
 	var visible bool
 	switch e.fill {
 	case fillColor:
@@ -239,30 +280,37 @@ func (p *Painter) background(e *Element, box Rect, withBorder bool) {
 	if !visible && !border {
 		return
 	}
-	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(box), Radii: p.radii(e.radius), Color: e.bg.scene(), Opacity: p.opacity}
+	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(box), Radii: p.radii(e.radius), Continuous: continuousCorners, Color: e.bg.scene(), Opacity: p.opacity}
+	var bc Color // the border's, if op draws it
 	if border {
 		op.Border, op.BorderColor, op.Dashed = p.borders(e.border), e.borderC.scene(), e.borderStyle == BorderDashed
+		bc = e.borderC
 	}
+	c, c2 := e.bg, Color{}
 	switch e.fill {
 	case fillGradient:
 		p.gradient(&op, e.grad)
+		c, c2 = e.grad.From, e.grad.To
 	case fillStripes:
 		st := e.stripes
+		c, c2 = st.c, e.bg
 		a := float64(st.angle) * math.Pi / 180
 		w := max(st.width*p.scale, 0.5)
 		op.Paint, op.Color, op.Color2 = scene.PaintStripes, st.c.scene(), e.bg.scene()
 		op.Gradient = [4]float32{float32(math.Cos(a)), float32(math.Sin(a)), w, w + max(st.gap*p.scale, 0)}
 	}
+	op.Wide = p.wide(c, c2, bc)
 	p.s.Ops = append(p.s.Ops, op)
 }
 
 // border paints e's border alone.
 func (p *Painter) border(e *Element, box Rect) {
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: p.snap(box), Radii: p.radii(e.radius), Opacity: p.opacity,
-		Border: p.borders(e.border), BorderColor: e.borderC.scene(), Dashed: e.borderStyle == BorderDashed})
+	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: p.snap(box), Radii: p.radii(e.radius), Continuous: continuousCorners, Opacity: p.opacity,
+		Border: p.borders(e.border), BorderColor: e.borderC.scene(), Dashed: e.borderStyle == BorderDashed, Wide: p.wide(Color{}, Color{}, e.borderC)})
 }
 
-// gradient sets the paint of op to g, across its rectangle.
+// gradient sets the paint of op to g, across its rectangle; the caller
+// sets op.Wide.
 func (p *Painter) gradient(op *scene.Op, g LinearGradient) {
 	// CSS angles: 0deg points up, 90deg right.
 	a := float64(g.Angle) * math.Pi / 180
@@ -360,7 +408,7 @@ func (p *Painter) divider(row bool, at, lo, hi, width float32, c Color) {
 	if !p.visible(box, 0) {
 		return
 	}
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: r, Color: c.scene(), Opacity: p.opacity})
+	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: r, Color: c.scene(), Wide: p.wide(c, Color{}, Color{}), Opacity: p.opacity})
 }
 
 // debug outlines an element and the elements inside it: their margins in
@@ -391,7 +439,7 @@ func (p *Painter) debug(e *Element) {
 
 func (p *Painter) pushClip(r Rect, radius [4]float32) {
 	p.clip = intersect(p.clip, r)
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpPushClip, Rect: p.snap(r), Radii: p.radii(radius)})
+	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpPushClip, Rect: p.snap(r), Radii: p.radii(radius), Continuous: continuousCorners})
 }
 
 func (p *Painter) popClip() {
@@ -444,10 +492,11 @@ func (p *Painter) textLayout(l *text.Layout, x, y float32, color Color, ts textS
 			if !gi.OK {
 				continue
 			}
+			glyphColor = glyphColor.Alpha(p.opacity)
 			sg := scene.Glyph{
 				X: ix + gi.Left, Y: baseline + gi.Top, W: float32(gi.W), H: float32(gi.H),
 				U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H,
-				Color: glyphColor.Alpha(p.opacity).scene(), Colored: gi.Colored, Subpixel: gi.Subpixel, Thin: gi.Thin,
+				Color: glyphColor.scene(), Wide: p.glyphWide(glyphColor), Colored: gi.Colored, Subpixel: gi.Subpixel, Thin: gi.Thin,
 			}
 			if run != nil {
 				run.add(p, g, gi, pen, sg, glyphShade, baseline)
@@ -487,7 +536,7 @@ type glyphRun struct {
 func (r *glyphRun) add(p *Painter, g text.Glyph, gi text.GlyphImage, pen float32, sg scene.Glyph, shade text.Shade, baseline float32) {
 	if n := len(r.glyphs); n > 0 {
 		prev := &r.glyphs[n-1]
-		if g.Font == r.font && sg.Color == prev.Color && !gi.Colored && p.rt.text.Shares(r.last, prev.X, prev.Y, gi, sg.X, sg.Y) {
+		if g.Font == r.font && sg.Color == prev.Color && sg.Wide == prev.Wide && !gi.Colored && p.rt.text.Shares(r.last, prev.X, prev.Y, gi, sg.X, sg.Y) {
 			r.ids, r.pens, r.glyphs, r.last = append(r.ids, g.ID), append(r.pens, pen), append(r.glyphs, sg), gi
 			return
 		}
@@ -545,7 +594,7 @@ func (p *Painter) decorations(l *text.Layout, li, i, j int, x, y float32, d deco
 				p.wave(st.X0, st.X1, (st.Top+st.Bottom)/2, max(st.Bottom-st.Top, 1), c)
 				continue
 			}
-			p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: st.X0, Y: st.Top, W: st.X1 - st.X0, H: st.Bottom - st.Top}, Color: c.scene(), Opacity: p.opacity})
+			p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: st.X0, Y: st.Top, W: st.X1 - st.X0, H: st.Bottom - st.Top}, Color: c.scene(), Wide: p.wide(c, Color{}, Color{}), Opacity: p.opacity})
 		}
 	}
 }
@@ -620,7 +669,7 @@ func (p *Painter) drawBitmap(img *Bitmap, box Rect, fit Fit, radius [4]float32, 
 	shown := img.smaller(min(frac.W*iw/(dst.W*p.scale), frac.H*ih/(dst.H*p.scale)))
 	sw, sh := float32(shown.W), float32(shown.H)
 	src := scene.Rect{X: frac.X * sw, Y: frac.Y * sh, W: frac.W * sw, H: frac.H * sh}
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpImage, Rect: p.snap(dst), Radii: p.radii(radius), Image: shown, Src: src, Opacity: p.opacity, Grayscale: gray})
+	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpImage, Rect: p.snap(dst), Radii: p.radii(radius), Continuous: continuousCorners, Image: shown, Src: src, Opacity: p.opacity, Grayscale: gray})
 }
 
 // scrollbars draws the thumbs of a scroll container whose content
@@ -651,7 +700,7 @@ func (p *Painter) scrollbars(e *Element) {
 		x = rescale(x, e.contentW-float64(e.w), w-float64(e.w))
 		y = rescale(y, e.contentH-float64(e.h), h-float64(e.h))
 	}
-	g := scrollBars(Rect{e.x, e.y, e.w, e.h}, float32(w), float32(h), float32(x), float32(y), e.flags, theme.scrollbarWidth())
+	g := scrollBars(Rect{e.x, e.y, e.w, e.h}, e.barInset, float32(w), float32(h), float32(x), float32(y), e.flags, theme.scrollbarWidth())
 	if g.vertical {
 		bar := g.v
 		if dragging && !rt.scrollDrag.horizontal {
@@ -685,10 +734,11 @@ type scrollGeometry struct {
 }
 
 // scrollBars returns the scroll bars of a container box scrolled by
-// (x, y) over content w×h, with thumbs width DIPs wide: those of the
+// (x, y) over content w×h, with thumbs width DIPs wide, moved in from its
+// edges by inset (top, right, bottom, left, ScrollbarInsets): those of the
 // directions its flags scroll that overflow, which leave each other the
 // corner where both show.
-func scrollBars(box Rect, w, h, x, y float32, flags uint32, width float32) scrollGeometry {
+func scrollBars(box Rect, inset [4]float32, w, h, x, y float32, flags uint32, width float32) scrollGeometry {
 	var g scrollGeometry
 	g.vertical = flags&flagScrollY != 0 && h > box.H+0.5
 	g.horizontal = flags&flagScrollX != 0 && w > box.W+0.5
@@ -696,15 +746,18 @@ func scrollBars(box Rect, w, h, x, y float32, flags uint32, width float32) scrol
 	if g.vertical && g.horizontal {
 		corner = width + 3
 	}
+	top, right, bottom, left := inset[0], inset[1], inset[2], inset[3]
 	if g.vertical {
-		g.vTrack = Rect{box.X + box.W - width - 6, box.Y, width + 6, box.H - corner}
-		t := scrollThumb(box.Y, box.H-corner, box.H, h, y)
-		g.v = Rect{box.X + box.W - width - 3, t.Y, width, t.H}
+		track := max(box.H-top-bottom-corner, 0)
+		g.vTrack = Rect{box.X + box.W - right - width - 6, box.Y + top, width + 6, track}
+		t := scrollThumb(box.Y+top, track, box.H, h, y)
+		g.v = Rect{box.X + box.W - right - width - 3, t.Y, width, t.H}
 	}
 	if g.horizontal {
-		g.hTrack = Rect{box.X, box.Y + box.H - width - 6, box.W - corner, width + 6}
-		t := scrollThumb(box.X, box.W-corner, box.W, w, x)
-		g.h = Rect{t.Y, box.Y + box.H - width - 3, t.H, width}
+		track := max(box.W-left-right-corner, 0)
+		g.hTrack = Rect{box.X + left, box.Y + box.H - bottom - width - 6, track, width + 6}
+		t := scrollThumb(box.X+left, track, box.W, w, x)
+		g.h = Rect{t.Y, box.Y + box.H - bottom - width - 3, t.H, width}
 	}
 	return g
 }
@@ -730,8 +783,9 @@ func (p *Painter) Fill(r Rect, c Color, radius float32) {
 
 // FillGradient paints a rounded rectangle with a gradient.
 func (p *Painter) FillGradient(r Rect, g LinearGradient, radius float32) {
-	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii([4]float32{radius, radius, radius, radius}), Opacity: p.opacity}
+	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii([4]float32{radius, radius, radius, radius}), Continuous: continuousCorners, Opacity: p.opacity}
 	p.gradient(&op, g)
+	op.Wide = p.wide(g.From, g.To, Color{})
 	p.s.Ops = append(p.s.Ops, op)
 }
 
@@ -744,8 +798,8 @@ func (p *Painter) Stroke(r Rect, c Color, radius, width float32) {
 // StrokeDashed paints the outline of a rounded rectangle in dashes, as a
 // dashed border.
 func (p *Painter) StrokeDashed(r Rect, c Color, radius, width float32) {
-	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii([4]float32{radius, radius, radius, radius}),
-		Border: p.borders([4]float32{width, width, width, width}), BorderColor: c.scene(), Dashed: true, Opacity: p.opacity}
+	op := scene.Op{Kind: scene.OpFill, Rect: p.snap(r), Radii: p.radii([4]float32{radius, radius, radius, radius}), Continuous: continuousCorners,
+		Border: p.borders([4]float32{width, width, width, width}), BorderColor: c.scene(), Dashed: true, Opacity: p.opacity, Wide: p.wide(Color{}, Color{}, c)}
 	p.s.Ops = append(p.s.Ops, op)
 }
 
@@ -767,8 +821,8 @@ func (p *Painter) shadow(box Rect, rad [4]float32, sh shadow) {
 			grown[i] = max(grown[i]+sh.spread, 0)
 		}
 	}
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpShadow, Rect: p.snap(r), Radii: p.radii(grown), Color: sh.color.scene(),
-		Blur: sh.blur * p.scale, Cast: p.snap(box), CastRadii: p.radii(rad), Opacity: p.opacity})
+	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpShadow, Rect: p.snap(r), Radii: p.radii(grown), Continuous: continuousCorners, Color: sh.color.scene(),
+		Wide: p.wide(sh.color, Color{}, Color{}), Blur: sh.blur * p.scale, Cast: p.snap(box), CastRadii: p.radii(rad), Opacity: p.opacity})
 }
 
 // Line paints a straight horizontal or vertical line between two points,

@@ -34,9 +34,11 @@ var fb *fake.Backend
 func TestMain(m *testing.M) {
 	if os.Getenv("MYGO_TEST_SECOND_INSTANCE") == "1" {
 		// Helper process for TestSingleInstance.
+		packageIdentifier = os.Getenv("MYGO_TEST_IDENTIFIER")
 		App.SetName("MyGoTest")
 		if App.RequestSingleInstanceLock() {
 			fmt.Println("locked")
+			releaseSingleInstanceLock()
 		} else {
 			fmt.Println("forwarded")
 		}
@@ -1279,7 +1281,7 @@ func TestMenuRolesAndState(t *testing.T) {
 	mu.Unlock()
 
 	menu.ItemByID("new").SetEnabled(false)
-	time.Sleep(20 * time.Millisecond)
+	onMain(func() {}) // the update reaches the backend on the main thread
 	updates := fb.MenuUpdates()
 	last := updates[len(updates)-1]
 	if last.ID != menu.ItemByID("new").uid || last.Enabled {
@@ -1473,6 +1475,9 @@ func beforeRun() {
 	Power.IsOnBattery()
 	GlobalShortcut.UnregisterAll()
 	NewNotification(NotificationOptions{}).Close()
+	// Nothing can be shown before Run, so there is nothing to clear and
+	// no backend to ask.
+	ClearNotifications()
 	for _, c := range needsAppCalls {
 		func() {
 			defer func() { fmt.Printf("%s: %v\n", c.name, recover()) }()
@@ -1550,6 +1555,23 @@ func TestGlobalShortcut(t *testing.T) {
 	}
 }
 
+// TestNotificationShowFails: Show returns what the backend answers, and
+// forgets a notification it could not show, which nothing will click.
+func TestNotificationShowFails(t *testing.T) {
+	onMain(func() { fb.NotificationError = ErrNotificationsDenied })
+	t.Cleanup(func() { onMain(func() { fb.NotificationError = nil }) })
+	n := NewNotification(NotificationOptions{Title: "Export finished"})
+	if err := n.Show(); !errors.Is(err, ErrNotificationsDenied) {
+		t.Errorf("Show = %v", err)
+	}
+	notifications.Lock()
+	_, kept := notifications.byID[n.id]
+	notifications.Unlock()
+	if kept {
+		t.Error("the notification is kept")
+	}
+}
+
 func TestParseColor(t *testing.T) {
 	rgba := func(r, g, b, a uint8) platform.Color { return platform.Color{R: r, G: g, B: b, A: a} }
 	tests := map[string]platform.Color{
@@ -1607,6 +1629,24 @@ func TestEncodeReply(t *testing.T) {
 	b = encodeReply(8, "k", make(chan int), nil).appendTo(nil)
 	if !strings.Contains(string(b), `"ok":false`) {
 		t.Errorf("unencodable result should be an error: %s", b)
+	}
+}
+
+// TestSingleInstanceIdentifier checks that an app with another identifier
+// but the same name, as the development app of mygo dev that calls SetName,
+// does not hand over to the running one.
+func TestSingleInstanceIdentifier(t *testing.T) {
+	if !App.RequestSingleInstanceLock() {
+		t.Fatal("first instance did not get the lock")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "MYGO_TEST_SECOND_INSTANCE=1", "MYGO_TEST_IDENTIFIER=com.example.mygotest.dev")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(out)) != "locked" {
+		t.Fatalf("an app with another identifier printed %q", out)
 	}
 }
 

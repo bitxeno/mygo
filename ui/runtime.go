@@ -17,6 +17,9 @@ type host interface {
 	// refreshRate returns how many times a second the display refreshes,
 	// 0 when unknown.
 	refreshRate() float32
+	// occluded reports whether nothing of the window shows, as when other
+	// windows cover it.
+	occluded() bool
 	present(s *scene.Scene)
 	requestFrame()
 	setCursor(Cursor)
@@ -31,7 +34,9 @@ type host interface {
 	titleBar() TitleBar
 	// invalidate asks for a frame from any goroutine.
 	invalidate()
-	openURL(string)
+	// post runs fn on the main thread soon; it is safe from any goroutine.
+	post(fn func())
+	openURL(url string, done func(error))
 	// popupMenu shows a context menu at (x, y) after the event being
 	// handled; chosen receives the ID of the item chosen.
 	popupMenu(m *platform.Menu, x, y float32, chosen func(id int))
@@ -71,6 +76,9 @@ type engine struct {
 	focusOrder  []uint64
 	focusScopes []focusScope
 	modal       uint64
+	// modalLayer is the element at the top of the overlay holding the
+	// dialog on top, which assistive technology sees with what is above.
+	modalLayer  uint64
 	commitScope focusScope
 	// The focus groups of the frame, the group of each element of the
 	// focus order in one, and the element of each that had the focus
@@ -82,8 +90,10 @@ type engine struct {
 	memberOf   map[uint64]uint64
 	groupLast  map[uint64]uint64
 	// openers are the elements that had the focus as overlays opened, by
-	// overlay.
+	// overlay; downs the elements the pointer went down on since the last
+	// pass (0 for none), for PressedOutside.
 	openers   map[uint64]uint64
+	downs     []uint64
 	regs      []shortcutReg
 	nextRegs  []shortcutReg
 	delivered []shortcutReg
@@ -120,13 +130,38 @@ type engine struct {
 	windowFocused bool
 	keys          []keyEvent
 	menu          menuState
-	toasts        []toast
-	nextToast     uint64
+	// toasts are the toasts the window holds, oldest first, and
+	// toastList those showing, as ToastViewportBase gives them; their time
+	// stops while toastsPaused. A viewport of them was built in the pass
+	// toastPass of the frame toastFrame.
+	toasts       []toast
+	nextToast    uint64
+	toastList    []Toast
+	toastsPaused bool
+	toastFrame   uint64
+	toastPass    int
 	// mods are the modifiers of the last pointer event.
 	mods Modifiers
 
-	consumed  bool
-	animating bool
+	consumed bool
+	// animating is set as a frame builds when something moves, for another
+	// frame built anew; repainting as it paints when only drawings move
+	// (Painter.AnimationFrame), for a frame painting its elements again,
+	// and repaintAt to when drawings change next (Painter.After). redraw
+	// tells that the next frame may paint again, as nothing else asked for
+	// one since; painted is the size and scale of the window, and gen the
+	// text system's Generation, as the last frame was built. repaintTimer
+	// asks for that frame at repaintDue. held tells that what moves waits
+	// for the window to show.
+	animating    bool
+	repainting   bool
+	repaintAt    time.Time
+	redraw       bool
+	held         bool
+	painted      [3]float32
+	gen          uint64
+	repaintTimer *time.Timer
+	repaintDue   time.Time
 	// late is set when lists built elements while laying out.
 	late bool
 	// revealIDs are the elements to scroll into view once the frame is
@@ -167,16 +202,14 @@ type engine struct {
 	// theme is the default theme, which follows the appearance and the
 	// preferences, made once until they change (themeOK); each pass
 	// starts from a copy, passTheme, which the view may change.
-	theme        Theme
-	themeOK      bool
-	passTheme    Theme
-	collect      bool
-	labels       []labelNode
-	tooltipFrame uint64
-	tooltipDepth int
-	hoverSince   time.Time
-	scrollDrag   scrollDrag
-	lastPress    struct {
+	theme      Theme
+	themeOK    bool
+	passTheme  Theme
+	collect    bool
+	labels     []labelNode
+	tips       tooltips
+	scrollDrag scrollDrag
+	lastPress  struct {
 		at     time.Time
 		x, y   float32
 		id     uint64
@@ -214,8 +247,10 @@ type shortcutReg struct {
 	id   uint64
 	mods Modifiers
 	key  Key
-	// overlay marks the registration of an overlay (overlayShortcut).
+	// overlay marks the registration of an overlay (overlayShortcut),
+	// made serial-th in its pass: the overlay made last is on top.
 	overlay bool
+	serial  int32
 }
 
 type keyEvent struct {
@@ -256,6 +291,7 @@ func (rt *engine) defaultTheme() *Theme {
 // desktop's preferences.
 func (rt *engine) themeChanged() {
 	rt.darkKnown, rt.prefsKnown = false, false
+	rt.redraw = false
 	rt.host.requestFrame()
 }
 
@@ -269,17 +305,16 @@ func (rt *engine) runFrame() {
 
 	rt.frame++
 	rt.stats.begin(rt)
-	now := time.Now()
-	if rt.clock != nil {
-		now = rt.clock()
-	}
+	now := rt.now()
 	w, h, scale := rt.host.size()
 	// The content takes the room the inspector leaves.
 	appW := rt.insp.contentWidth(w)
 	rt.insp.lap(-1)
 	rt.c.titleBar = rt.host.titleBar()
 	rt.text.BeginFrame()
-	rt.animating = false
+	rt.gen = rt.text.Generation()
+	rt.painted = [3]float32{w, h, scale}
+	rt.animating, rt.repainting, rt.repaintAt = false, false, time.Time{}
 	rt.routeKeys()
 	if rt.drag != nil {
 		// The source's element is this frame's, if it builds one.
@@ -353,11 +388,98 @@ func (rt *engine) runFrame() {
 		h.announced = append(h.announced, rt.announcements...)
 	}
 	rt.announcements = rt.announcements[:0]
-	if rt.animating {
-		rt.host.requestFrame()
-	}
+	rt.next()
 	rt.armTimer()
 	rt.showMenu()
+	rt.stats.end(rt)
+}
+
+// now returns the time, which tests set (clock).
+func (rt *engine) now() time.Time {
+	if rt.clock != nil {
+		return rt.clock()
+	}
+	return time.Now()
+}
+
+// next asks for the frame that what moves needs: one built anew while the
+// view animates, one painting the elements again while only drawings move,
+// as soon as the display can show it or when they change next. While
+// nothing of the window shows, what moves waits until some of it does
+// (SurfaceShown) rather than draw frames nobody sees, as browsers pause
+// the animation frames of windows out of sight.
+func (rt *engine) next() {
+	rt.redraw, rt.repaintDue, rt.held = false, time.Time{}, false
+	moving := rt.animating || rt.repainting || !rt.repaintAt.IsZero()
+	switch {
+	case moving && rt.host.occluded():
+		rt.held = true
+	case rt.animating:
+		rt.host.requestFrame()
+	case rt.repainting:
+		rt.redraw = true
+		rt.host.requestFrame()
+	case !rt.repaintAt.IsZero():
+		rt.redraw, rt.repaintDue = true, rt.repaintAt
+		d := max(rt.repaintAt.Sub(rt.now()), time.Millisecond)
+		if rt.repaintTimer == nil {
+			rt.repaintTimer = time.AfterFunc(d, func() { rt.host.post(rt.repaintNow) })
+		} else {
+			rt.repaintTimer.Reset(d)
+		}
+		return
+	}
+	if rt.repaintTimer != nil {
+		rt.repaintTimer.Stop()
+	}
+}
+
+// repaintNow asks for the frame painting drawings again that Painter.After
+// asked for, unless another frame came since.
+func (rt *engine) repaintNow() {
+	if rt.redraw && !rt.repaintDue.IsZero() && !rt.now().Before(rt.repaintDue.Add(-time.Millisecond)) {
+		rt.repaintDue = time.Time{}
+		rt.host.requestFrame()
+	}
+}
+
+// surfaceFrame draws the frame the surface asked for: the last frame's
+// elements painted again when only drawings moved since, else a frame
+// built anew.
+func (rt *engine) surfaceFrame() {
+	if w, h, scale := rt.host.size(); rt.redraw && !rt.inFrame && rt.c.root != nil &&
+		rt.painted == [3]float32{w, h, scale} && rt.text.Generation() == rt.gen {
+		rt.repaintFrame(w, h, scale)
+		return
+	}
+	rt.runFrame()
+}
+
+// repaintFrame paints the elements of the last frame again, at the time of
+// this one, for drawings that move with it (Painter.AnimationFrame) while
+// nothing else changed: the view is neither built nor laid out, so what
+// moves costs only its painting. Its timers stay as the last frame built
+// armed them.
+func (rt *engine) repaintFrame(w, h, scale float32) {
+	rt.inFrame = true
+	defer func() { rt.inFrame = false }()
+	rt.stats.begin(rt)
+	start := time.Now()
+	rt.c.now = rt.now()
+	rt.text.BeginFrame()
+	rt.repainting, rt.repaintAt = false, time.Time{}
+	root := rt.c.root
+	rt.paint(root, w, h, scale)
+	for try := 0; try < 2 && rt.text.Full(); try++ {
+		rt.text.MakeRoom()
+		rt.paint(root, w, h, scale)
+	}
+	rt.stats.lap(phasePaint)
+	rt.insp.repainted(time.Since(start))
+	rt.host.present(&rt.scene)
+	rt.stats.lap(phasePresent)
+	rt.text.EndFrame()
+	rt.next()
 	rt.stats.end(rt)
 }
 
@@ -374,6 +496,7 @@ func (rt *engine) endPass() {
 	rt.clickLater = rt.clickLater[:0]
 	rt.menu.chosen = 0
 	rt.delivered = rt.delivered[:0]
+	rt.downs = rt.downs[:0]
 	// The next pass may not ask again, as when the view cleared what asked.
 	for _, e := range rt.c.reveal {
 		if !slices.Contains(rt.revealIDs, e.id) {
@@ -400,10 +523,11 @@ func (rt *engine) forgetInput() {
 // prune forgets the elements the frame did not build, but those of the
 // pages Routers keep.
 func (rt *engine) prune() {
+	unpressed := false
 	for id, s := range rt.states {
 		if s.seen != rt.frame || s.pass != rt.pass {
 			if rt.pressed == s {
-				rt.pressed = nil
+				rt.pressed, unpressed = nil, true
 			}
 			if !rt.keptAlive(s) {
 				delete(rt.states, id)
@@ -415,6 +539,16 @@ func (rt *engine) prune() {
 				}
 			}
 		}
+	}
+	if unpressed {
+		// The element pressed went away, as a button showing over a row
+		// the pointer left: what the pointer is over now hovers, rather
+		// than what it was over as the press began.
+		var chain []uint64
+		if rt.pointerIn {
+			chain = rt.hitChain(rt.pointerX, rt.pointerY)
+		}
+		rt.setHover(chain)
 	}
 	rt.restoreFocus()
 	// The focus does not stay in a page kept out of sight.
@@ -444,11 +578,20 @@ func (rt *engine) keptAlive(s *state) bool {
 	return false
 }
 
-// requestFrame asks the host for a frame, unless one is being built.
+// requestFrame asks the host for a frame built anew, unless one is being
+// built.
 func (rt *engine) requestFrame() {
 	if rt.inFrame {
 		return
 	}
+	rt.redraw = false
+	rt.host.requestFrame()
+}
+
+// changed asks the host for a frame built anew after the app changed what
+// the view shows, from outside the view (surface.Conn.Changed).
+func (rt *engine) changed() {
+	rt.redraw = false
 	rt.host.requestFrame()
 }
 
@@ -483,6 +626,9 @@ func (rt *engine) close() {
 	if rt.timer != nil {
 		rt.timer.Stop()
 	}
+	if rt.repaintTimer != nil {
+		rt.repaintTimer.Stop()
+	}
 }
 
 // commit records the laid out frame in the elements' states: their
@@ -490,7 +636,7 @@ func (rt *engine) close() {
 func (rt *engine) commit(root *Element, w, h float32) {
 	rt.hits = rt.hits[:0]
 	rt.focusOrder, rt.focusScopes = rt.focusOrder[:0], rt.focusScopes[:0]
-	rt.modal, rt.commitScope, rt.commitPage = 0, focusScope{}, 0
+	rt.modal, rt.modalLayer, rt.commitScope, rt.commitPage = 0, 0, focusScope{}, 0
 	if rt.groups == nil {
 		rt.groups = map[uint64]groupInfo{}
 	}
@@ -522,12 +668,16 @@ func (rt *engine) commitElement(e *Element, clip Rect, hidden bool) {
 		s.parent = 0
 	}
 	s.flags = e.flags
+	s.anchor = 0
+	if e.popover != nil {
+		s.anchor = e.popover.id
+	}
 	if e.parent != nil && e.parent.st.flags&flagDisabled != 0 {
 		// Disabled with the element around it, which may have been
 		// disabled after building it, as a Fieldset.
 		s.flags |= flagDisabled
 	}
-	s.cursor = e.cursor
+	s.cursor, s.tip = e.cursor, e.tip
 	s.role = e.role
 	s.input, s.caret, s.takesText = e.inputFn, e.caret, e.takesText
 	if e.flags&(flagEditable|flagSelectable) != 0 && s.cursor == 0 {
@@ -535,9 +685,11 @@ func (rt *engine) commitElement(e *Element, clip Rect, hidden bool) {
 	}
 	v := intersect(Rect{e.x, e.y, e.w, e.h}, clip)
 	s.vx, s.vy, s.vw, s.vh = v.X, v.Y, v.W, v.H
-	s.cx, s.cw = e.x+e.contentX(), max(e.w-e.padX(), 0)
+	s.cx, s.cy = e.x+e.contentX(), e.y+e.contentY()
+	s.cw, s.ch = max(e.w-e.padX(), 0), max(e.h-e.padY(), 0)
 	if e.flags&(flagScrollX|flagScrollY) != 0 {
 		s.contentW, s.contentH = e.contentW, e.contentH
+		s.barInset = e.barInset
 	}
 	// What is invisible keeps its box but takes neither the pointer nor
 	// the focus, and has no text to find; so does what is inert, which

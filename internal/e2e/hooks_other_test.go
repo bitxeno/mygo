@@ -72,6 +72,8 @@ func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return
 func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
 func loseComposition(bool) bool                   { return false }
 
+func failWebViews(int) bool { return false }
+
 // A Control-click is a secondary click on macOS only.
 func controlClick(*mygo.Window, float64, float64) bool { return false }
 
@@ -94,8 +96,16 @@ const roleListItem = "list item"
 func clickAndType(*mygo.Window, float64, float64, string) bool { return false }
 func compose(*mygo.Window, string, int, bool) bool             { return false }
 
-// Only Linux draws native UI in a GtkGLArea.
+// Only Linux draws native UI in a GtkGLArea, nor waits to load the GPU's
+// driver.
 func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 0, 0, false }
+func lazyGPU(bool) bool                                       { return false }
+func useGPU(*mygo.Window) bool                                { return false }
+func surfaceInputLowest(*mygo.Window) bool                    { return true }
+func surfaceOnScreen(*mygo.Window) ([]byte, bool)             { return nil, false }
+
+// Only macOS has key-value observing.
+func observe(*mygo.Window) (func(), bool) { return nil, false }
 
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
@@ -107,3 +117,13 @@ func panelSemantics(*mygo.Window) (panel, key bool, supported bool) {
 }
 
 func frontmostPID() int { return 0 }
+
+// Input methods keep the keys typed while they compose from the content
+// themselves here (GTK's filtering, IMM32's VK_PROCESSKEY), which a
+// composition the test makes up does not show.
+func pressKey(*mygo.Window, uint16, string) bool { return false }
+
+// AppKit's older accessibility API is macOS's.
+func axAttribute(*mygo.Window, string, string) (string, bool, bool, bool) {
+	return "", false, false, false
+}

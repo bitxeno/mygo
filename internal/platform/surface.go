@@ -1,5 +1,7 @@
 package platform
 
+import "image"
+
 // Surface is the drawing area of a window created with
 // WindowOptions.Surface, which shows content MyGo draws itself (package
 // ui) instead of a webview. Its methods run on the main thread.
@@ -30,6 +32,50 @@ type Surface interface {
 	// elements. The content calls it after every frame once the surface
 	// sent AccessibilityOn.
 	UpdateAccessibility(tree *AccessTree)
+}
+
+// LazyGPUSurface is a Surface that draws in memory until its content asks
+// for the GPU, because a GPU renderer would take much memory for good:
+// Linux's, whose OpenGL driver, Mesa's some 50 MB, stays loaded once a
+// context made it load.
+type LazyGPUSurface interface {
+	// UseGPU makes Native give the objects of a GPU renderer from the
+	// next frame on, which it asks for, where the GPU can draw, and
+	// reports whether it will. It is not called while a frame is drawn.
+	UseGPU() bool
+}
+
+// DamageSurface is a Surface that shows a frame drawn in memory by what
+// changed since the last one: Linux's, whose toolkit then repaints, and
+// the compositor takes, only that.
+type DamageSurface interface {
+	// PresentDamage is PresentPixels for a frame that differs from the
+	// last one presented only within damage, in device pixels.
+	PresentDamage(pix []byte, stride, width, height int, damage []image.Rectangle)
+}
+
+// OccludableSurface is a Surface that tells when nothing of it shows, as
+// when other windows cover its window, while the system may still give it
+// frames: the content then draws nothing that moves until it shows again.
+type OccludableSurface interface {
+	// Occluded reports whether nothing of the surface shows on screen. The
+	// surface sends SurfaceShown once some of it shows again.
+	Occluded() bool
+}
+
+// WideGamutSurface is a Surface that tells whether its window's screen
+// shows colors outside the sRGB gamut (macOS's).
+type WideGamutSurface interface {
+	// WideGamut reports whether the screen showing most of the window
+	// shows colors outside the sRGB gamut, as Display P3 screens do.
+	WideGamut() bool
+}
+
+// IdleSurface is a Surface that can give back memory once frames stop.
+type IdleSurface interface {
+	// Idle tells that no frame came for a while: the surface may give
+	// back memory that drawing frames took and freed.
+	Idle()
 }
 
 // TextInputState is the state of the text input that has the keyboard,
@@ -111,6 +157,9 @@ const (
 	// AccessAction performs Action on the element ID of the accessibility
 	// tree, with Text the value of AccessSetValue.
 	AccessAction
+	// SurfaceShown reports that some of an OccludableSurface shows again
+	// after none did.
+	SurfaceShown
 )
 
 // SurfaceEvent is input on a Surface, or a change of it.

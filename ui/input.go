@@ -11,6 +11,10 @@ import (
 // event handles a surface event on the main thread. It reports whether
 // an element takes files dragged over or dropped at the event's position.
 func (rt *engine) event(ev platform.SurfaceEvent) (taken bool) {
+	if ev.Kind != platform.SurfaceFrame {
+		// Whatever the event changes, the next frame builds anew.
+		rt.redraw = false
+	}
 	x, y := float32(ev.X), float32(ev.Y)
 	if rt.insp.pointer(rt, ev, x, y) {
 		return true
@@ -21,9 +25,15 @@ func (rt *engine) event(ev platform.SurfaceEvent) (taken bool) {
 	}
 	switch ev.Kind {
 	case platform.SurfaceFrame:
-		rt.runFrame()
+		rt.surfaceFrame()
 	case platform.SurfaceResize:
 		rt.requestFrame()
+	case platform.SurfaceShown:
+		if rt.held {
+			// What moves goes on from where the time puts it.
+			rt.held = false
+			rt.requestFrame()
+		}
 	case platform.PointerMove:
 		rt.pointerMove(x, y)
 	case platform.PointerDown:
@@ -36,6 +46,9 @@ func (rt *engine) event(ev platform.SurfaceEvent) (taken bool) {
 		rt.pointerIn = false
 		if rt.pressed == nil {
 			rt.setHover(nil)
+		} else {
+			// The elements around the one pressed hover no more.
+			rt.requestFrame()
 		}
 	case platform.PointerScroll:
 		rt.pointerMove(x, y)
@@ -135,7 +148,6 @@ func (rt *engine) setHover(chain []uint64) bool {
 		}
 	}
 	rt.hover = chain
-	rt.hoverSince = time.Now()
 	if need {
 		rt.requestFrame()
 	}
@@ -163,6 +175,8 @@ func (rt *engine) pointerMove(x, y float32) {
 		rt.pressed.dragY += y - rt.pointerY
 		if rt.pressed.flags&(flagTrackPointer|flagDraggable|flagEditable|flagSelectable) != 0 {
 			rt.requestFrame()
+		} else {
+			rt.pressMove(rt.pointerX, rt.pointerY, x, y)
 		}
 		rt.dragMove(x, y)
 	}
@@ -204,6 +218,11 @@ const interactive = flagClickable | flagFocusable | flagEditable | flagSelectabl
 func (rt *engine) pointerDown(x, y float32, button int, mods Modifiers, count int) {
 	chain := rt.hitChain(x, y)
 	rt.setHover(chain)
+	if len(chain) > 0 {
+		rt.downs = append(rt.downs, chain[0])
+	} else {
+		rt.downs = append(rt.downs, 0)
+	}
 	if button == 0 && rt.scrollbarPress(chain, x, y) {
 		return
 	}
@@ -360,7 +379,7 @@ func dragTo(from float64, moved, travel float32, reach, now float64) float64 {
 // content's size as the drag started.
 func (d *scrollDrag) bars(width float32) scrollGeometry {
 	s := d.st
-	return scrollBars(Rect{s.x, s.y, s.w, s.h}, float32(d.contentW), float32(d.contentH), float32(s.scrollX), float32(s.scrollY), s.flags, width)
+	return scrollBars(Rect{s.x, s.y, s.w, s.h}, s.barInset, float32(d.contentW), float32(d.contentH), float32(s.scrollX), float32(s.scrollY), s.flags, width)
 }
 
 // scrollBy scrolls a container by dx, dy within its content, and reports
@@ -641,9 +660,13 @@ func (rt *engine) routeKeys() {
 				break
 			}
 		}
-		for i := len(rt.regs) - 1; i >= 0 && !found; i-- {
-			if r := rt.regs[i]; r.overlay && r.mods == k.mods && r.key == k.key {
-				target, found = r.id, true
+		if !found {
+			// The overlay on top: the one made last, as it paints last.
+			var top int32 = -1
+			for _, r := range rt.regs {
+				if r.overlay && r.mods == k.mods && r.key == k.key && r.serial >= top {
+					target, found, top = r.id, true, r.serial
+				}
 			}
 		}
 		if !found {
@@ -708,7 +731,7 @@ func (rt *engine) updateTextInput() {
 		// An element taking text itself: no text around the caret.
 		t.Active = true
 		t.Caret = platform.RectF{X: float64(s.x + s.caret.X), Y: float64(s.y + s.caret.Y), W: float64(s.caret.W), H: float64(s.caret.H)}
-	} else if s != nil && s.editor != nil && s.flags&flagEditable != 0 && rt.windowFocused {
+	} else if s != nil && s.editor != nil && s.flags&flagEditable != 0 && !s.editor.readOnly && rt.windowFocused {
 		ed := s.editor
 		r := ed.caretRect(s)
 		t.Active = true
@@ -794,29 +817,52 @@ func (e *Element) RightClicked() bool {
 	return true
 }
 
-// Hovered reports whether the pointer is over the element.
+// Hovered reports whether the pointer is over the element. While the
+// pointer presses an element, the elements it was over as the press began,
+// as those around the element pressed, stay hovered as long as it is over
+// them, as in CSS, and the others hover no more: a button that shows over
+// a row stays as it is pressed, and dragging over other elements does not
+// light them up.
 func (e *Element) Hovered() bool {
 	e.flags |= flagHover
 	if e.IsDisabled() {
 		return false
 	}
 	rt := e.c.rt
-	if rt.pressed != nil && rt.pressed.id != e.id {
+	if !slices.Contains(rt.hover, e.id) {
 		return false
 	}
-	for _, id := range rt.hover {
-		if id == e.id {
-			return true
-		}
+	if p := rt.pressed; p != nil && p.id != e.id {
+		// The hover holds the elements under the pointer as the press
+		// began.
+		s := e.st
+		return rt.pointerIn && Rect{s.vx, s.vy, s.vw, s.vh}.Contains(rt.pointerX, rt.pointerY)
 	}
-	return false
+	return true
 }
 
-// Pressed reports whether the element is being pressed with the pointer.
+// pressMove asks for a frame when the pointer, pressing an element, moves
+// in or out of an element around it that looks at its hover (Hovered).
+func (rt *engine) pressMove(x0, y0, x1, y1 float32) {
+	for _, id := range rt.hover {
+		s := rt.states[id]
+		if s == nil || s == rt.pressed || s.flags&flagHover == 0 {
+			continue
+		}
+		r := Rect{s.vx, s.vy, s.vw, s.vh}
+		if r.Contains(x0, y0) != r.Contains(x1, y1) {
+			rt.requestFrame()
+			return
+		}
+	}
+}
+
+// Pressed reports whether the element is being pressed with the pointer,
+// unless it is disabled.
 func (e *Element) Pressed() bool {
 	e.flags |= flagClickable | flagHover
 	s := e.st
-	return s.pressed && Rect{s.vx, s.vy, s.vw, s.vh}.Contains(e.c.rt.pointerX, e.c.rt.pointerY)
+	return s.pressed && !e.disabled() && Rect{s.vx, s.vy, s.vw, s.vh}.Contains(e.c.rt.pointerX, e.c.rt.pointerY)
 }
 
 // Focused reports whether the element has the keyboard focus.
@@ -864,8 +910,11 @@ func (e *Element) AutoFocus() *Element {
 
 // Shortcut reports whether the key with exactly the modifiers mods was
 // pressed while the element or one of its descendants had the focus. The
-// innermost element handling a key gets it.
+// innermost element handling a key gets it; a disabled one handles none.
 func (e *Element) Shortcut(mods Modifiers, key Key) bool {
+	if e.disabled() {
+		return false
+	}
 	return e.c.rt.shortcut(e.id, mods, key)
 }
 
@@ -909,7 +958,7 @@ func (rt *engine) scrollbarPress(chain []uint64, x, y float32) bool {
 		if s == nil || s.flags&(flagScrollX|flagScrollY) == 0 || s.flags&flagNoBars != 0 {
 			continue
 		}
-		g := scrollBars(Rect{s.x, s.y, s.w, s.h}, float32(s.contentW), float32(s.contentH), float32(s.scrollX), float32(s.scrollY), s.flags, rt.c.theme.scrollbarWidth())
+		g := scrollBars(Rect{s.x, s.y, s.w, s.h}, s.barInset, float32(s.contentW), float32(s.contentH), float32(s.scrollX), float32(s.scrollY), s.flags, rt.c.theme.scrollbarWidth())
 		d := &rt.scrollDrag
 		w, h := float64(s.w), float64(s.h)
 		switch {

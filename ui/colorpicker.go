@@ -57,7 +57,7 @@ func (x hsva) color() Color {
 		r, b = c, y
 	}
 	m := x.v - c
-	return Color{byte8(r + m), byte8(g + m), byte8(b + m), byte8(x.a)}
+	return Color{R: byte8(r + m), G: byte8(g + m), B: byte8(b + m), A: byte8(x.a)}
 }
 
 func byte8(v float64) uint8 { return uint8(math.Round(math.Max(0, math.Min(1, v)) * 255)) }
@@ -137,7 +137,7 @@ func ColorPicker(c *Context, color *Color) *Element {
 			set(hsva{x.h, x.s, x.v - 0.01, x.a})
 		}
 		x = st.hsv
-		sq.hasRange, sq.accRange = true, [3]float64{0, 100, math.Round(x.s * 100)}
+		sq.hasRange, sq.accRange, sq.accStep = true, [3]float64{0, 100, math.Round(x.s * 100)}, 1
 		sq.accValue = fmt.Sprintf("%.0f%% saturation, %.0f%% brightness", x.s*100, x.v*100)
 		hue := hsva{x.h, 1, 1, 1}.color()
 		sq.Draw(func(p *Painter, r Rect) {

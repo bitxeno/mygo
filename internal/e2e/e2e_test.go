@@ -117,7 +117,7 @@ func TestMain(m *testing.M) {
 		beforeRun(mygo.ThemeSource(s))
 		return
 	}
-	mygo.Bind(Greeter{}, probe, streams)
+	mygo.Bind(Greeter{}, probe, streams, Bench{})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -133,6 +133,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(w, "echo:%s", b)
 	})
 	usePlugins(mux)
+	useBench(mux)
 	if err := mygo.Protocol.Handle("app", mux); err != nil {
 		panic(err)
 	}
@@ -143,6 +144,7 @@ func TestMain(m *testing.M) {
 	code := 1
 	mygo.App.WhenReady(func() {
 		go func() {
+			warmUp()
 			code = m.Run()
 			mygo.App.Quit()
 		}()
@@ -152,6 +154,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Exit(code)
+}
+
+// warmUp shows a page once before the tests, so that the first test to
+// show one does not pay for starting the webview: WebView2 starts its
+// browser, GPU and renderer processes with the first page, which took a
+// slow runner over ten seconds.
+func warmUp() {
+	start := time.Now()
+	w := mygo.NewWindow(mygo.WindowOptions{Hidden: true, Title: "warm-up"})
+	defer w.Destroy()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := w.Page().EvalContext(ctx, "1"); err != nil {
+		fmt.Printf("e2e: the webview did not start in %v: %v\n", time.Since(start).Round(time.Millisecond), err)
+	} else if d := time.Since(start); d > 3*time.Second {
+		fmt.Printf("e2e: the webview took %v to start\n", d.Round(time.Millisecond))
+	}
 }
 
 // quitDuringDialog is a helper process for TestQuitDuringDialog: it quits
@@ -421,17 +440,53 @@ func TestEarlyWindow(t *testing.T) {
 // waitFor polls the page until expr is truthy. Until a page being loaded
 // commits, expr runs in the previous one, such as the empty document a new
 // window starts with, which is complete already: wait for something of the
-// page itself.
-func waitFor(t *testing.T, w *mygo.Window, expr string) {
+// page itself. The 10 seconds start once the page first answers: WebView2
+// creates a window's webview asynchronously, and evaluating waits for it,
+// which may take longer than that on a slow runner.
+func waitFor(t testing.TB, w *mygo.Window, expr string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if ok, _ := mygo.EvalAs[bool](w.Page(), "!!("+expr+")"); ok {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	p := w.Page()
+	check := "!!(" + expr + ")"
+	start := time.Now()
+	first, cancel := context.WithTimeout(t.Context(), time.Minute)
+	v, err := p.EvalContext(first, check)
+	late := err != nil && first.Err() != nil
+	cancel()
+	answered := time.Since(start)
+	if late {
+		t.Fatalf("waiting for %s: the page did not answer in %v: %v; %s", expr, answered.Round(time.Millisecond), err, pageState(p))
 	}
-	t.Fatalf("timed out waiting for %s", expr)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	for v != true {
+		select {
+		case <-ctx.Done():
+			msg := fmt.Sprintf("timed out waiting for %s, 10s after the page first answered (in %v)", expr, answered.Round(time.Millisecond))
+			if err != nil {
+				msg += "; the last check failed: " + err.Error()
+			}
+			t.Fatalf("%s; %s", msg, pageState(p))
+		case <-time.After(20 * time.Millisecond):
+		}
+		v, err = p.EvalContext(ctx, check)
+	}
+}
+
+// pageState describes where a page is, for failures: what the webview
+// reports, and what the page itself says, if it answers.
+func pageState(p *mygo.Page) string {
+	s := fmt.Sprintf("the webview is at %q (loading: %v)", p.URL(), p.IsLoading())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	v, err := p.EvalContext(ctx, "[location.href, document.title, document.readyState]")
+	if err != nil {
+		return s + ", and the page did not answer: " + err.Error()
+	}
+	a, _ := v.([]any)
+	if len(a) != 3 {
+		return fmt.Sprintf("%s, and the page answered %v", s, v)
+	}
+	return fmt.Sprintf("%s; location.href %q, document.title %q, document.readyState %q", s, a[0], a[1], a[2])
 }
 
 func newWindow(t *testing.T, opts mygo.WindowOptions) *mygo.Window {
@@ -1693,6 +1748,85 @@ func TestCapturePage(t *testing.T) {
 	}
 }
 
+// callEnd is how a call of pageCalls ended.
+type callEnd struct {
+	name string
+	err  error
+}
+
+// pageCalls makes the calls that wait for a page's answer, each on a
+// goroutine of its own, and tells how they end.
+func pageCalls(w *mygo.Window) <-chan callEnd {
+	ended := make(chan callEnd, 3)
+	call := func(name string, fn func() error) {
+		go func() { ended <- callEnd{name, fn()} }()
+	}
+	call("Eval", func() error { _, err := w.Page().Eval("1"); return err })
+	call("CapturePage", func() error { _, err := w.CapturePage(); return err })
+	call("PrintToPDF", func() error { _, err := w.Page().PrintToPDF(mygo.PDFOptions{}); return err })
+	return ended
+}
+
+// waitCalls waits for the calls of pageCalls to end, and returns their
+// errors by name. A slow runner takes seconds to create a webview, and a
+// window may ask for its webview again.
+func waitCalls(t *testing.T, ended <-chan callEnd, what string) map[string]error {
+	t.Helper()
+	got := map[string]error{}
+	for range 3 {
+		select {
+		case e := <-ended:
+			got[e.name] = e.err
+		case <-time.After(time.Minute):
+			t.Fatalf("%s: only these calls ended: %v", what, got)
+		}
+	}
+	return got
+}
+
+// TestCallsEndWithTheWindow: calls on a new window's page, which on
+// Windows wait for WebView2 to create its webview, end when the window is
+// destroyed.
+func TestCallsEndWithTheWindow(t *testing.T) {
+	w := mygo.NewWindow(mygo.WindowOptions{Hidden: true})
+	ended := pageCalls(w)
+	time.Sleep(20 * time.Millisecond)
+	mygo.RunOnMain(func() {}) // the calls reached the window
+	w.Destroy()
+	waitCalls(t, ended, "after Destroy")
+}
+
+// TestWebViewFails: WebView2 may fail to create a window's webview, as it
+// does under load. The window asks again, and once it gives up, the calls
+// waiting for the webview fail with the reason, as do later ones.
+func TestWebViewFails(t *testing.T) {
+	if !failWebViews(1) {
+		t.Skip("only WebView2 creates webviews after their windows")
+	}
+	t.Cleanup(func() { failWebViews(0) })
+	const reason = "creating the WebView2 controller"
+	w := newWindow(t, mygo.WindowOptions{Hidden: true})
+	got := waitCalls(t, pageCalls(w), "after a failure")
+	for name, err := range got {
+		if err != nil && strings.Contains(err.Error(), reason) {
+			t.Errorf("after a failure, %s: %v", name, err)
+		}
+	}
+	if got["Eval"] != nil {
+		t.Errorf("after a failure, Eval: %v", got["Eval"])
+	}
+
+	failWebViews(1 << 10)
+	w = newWindow(t, mygo.WindowOptions{Hidden: true})
+	for _, when := range []string{"waiting", "later"} {
+		for name, err := range waitCalls(t, pageCalls(w), when) {
+			if err == nil || !strings.Contains(err.Error(), reason) {
+				t.Errorf("%s, %s: %v", when, name, err)
+			}
+		}
+	}
+}
+
 func TestMenuAndClipboard(t *testing.T) {
 	clicked := make(chan string, 1)
 	menu := mygo.NewMenu([]*mygo.MenuItem{
@@ -2235,6 +2369,64 @@ func TestContentWindowAccessibility(t *testing.T) {
 	}
 }
 
+// TestContentWindowObserved resizes a window of native UI and acts on its
+// elements as assistive technology does while key-value observing watches
+// them, as other code may: the runtime gives each a generated subclass of
+// its class, so their overrides must call the superclass of the class they
+// are defined in, not of the object's, which would call them again until
+// the stack overflows (#79).
+func TestContentWindowObserved(t *testing.T) {
+	var frames atomic.Int32
+	name, notes := "Ada", "Read only"
+	view := func(c *ui.Context) {
+		frames.Add(1)
+		ui.Column(c).Fill().Padding(20).Gap(10).Children(func() {
+			ui.Text(c, "Settings")
+			ui.TextInput(c, &name).Label("Name")
+			ui.TextInput(c, &notes).Label("Notes").ReadOnly(true)
+			ui.Column(c).Role(ui.RoleMenu).Label("Edit menu").Children(func() {
+				ui.Text(c, "Bold").Role(ui.RoleMenuItemCheckBox).Checked(true)
+			})
+		})
+	}
+	w := newWindow(t, mygo.WindowOptions{Title: "Observed", Width: 400, Height: 300, Content: ui.View(view)})
+	eventually(t, "a frame", func() bool { return frames.Load() > 0 })
+	eventually(t, "the text field", func() bool {
+		nodes, _ := accessibility(w)
+		return slices.ContainsFunc(nodes, func(n accessNode) bool { return n.role == roleTextField })
+	})
+	stop, ok := observe(w)
+	if !ok {
+		t.Skip("only macOS has key-value observing")
+	}
+	defer stop()
+	before := frames.Load()
+	w.SetSize(500, 400)
+	eventually(t, "a frame at the new size", func() bool { return frames.Load() > before })
+	if !accessPerform(w, "Name", "value", "Grace") {
+		t.Fatal("cannot set the text field's value")
+	}
+	eventually(t, "the text field's new value", func() bool {
+		var s string
+		mygo.RunOnMain(func() { s = name })
+		return s == "Grace"
+	})
+	// AppKit answers for what the element does not.
+	if accessPerform(w, "Settings", "press", "") {
+		t.Error("a text could be pressed")
+	}
+	// The overrides of the older API answer too.
+	if _, settable, _, ok := axAttribute(w, "Name", "AXValue"); ok && !settable {
+		t.Error("the text field's value is not settable")
+	}
+	if _, settable, _, ok := axAttribute(w, "Notes", "AXValue"); ok && settable {
+		t.Error("the read-only text field's value is settable")
+	}
+	if mark, _, named, ok := axAttribute(w, "Bold", "AXMenuItemMarkChar"); ok && (mark != "✓" || !named) {
+		t.Errorf("the menu item's mark is %q, named %v", mark, named)
+	}
+}
+
 // TestContentWindowListAccessibility reads the rows of a List as assistive
 // technology does, and chooses one by pressing it.
 func TestContentWindowListAccessibility(t *testing.T) {
@@ -2334,6 +2526,40 @@ func TestContentWindowTyping(t *testing.T) {
 	eventually(t, "the composed text", func() bool { return text() == "héllo日本" })
 }
 
+// TestContentWindowComposingKeys presses Escape and Return in a dialog's
+// text input while an input method composes: they are the input method's,
+// and neither close the dialog nor submit the input.
+func TestContentWindowComposingKeys(t *testing.T) {
+	var frames atomic.Int32
+	open, submitted, name := true, 0, ""
+	view := func(c *ui.Context) {
+		frames.Add(1)
+		ui.Modal(c, &open, func() {
+			if ui.TextInput(c, &name).AutoFocus().Submitted() {
+				submitted++
+			}
+		})
+	}
+	state := func() (o bool, s int, n string) {
+		mygo.RunOnMain(func() { o, s, n = open, submitted, name })
+		return o, s, n
+	}
+	w := newWindow(t, mygo.WindowOptions{Title: "Composing", Width: 400, Height: 200, Content: ui.View(view)})
+	eventually(t, "a frame", func() bool { return frames.Load() > 1 })
+	compose(w, "ni", 2, false)
+	if !pressKey(w, 53, "\x1b") { // Escape
+		t.Skip("key automation not available on this platform")
+	}
+	pressKey(w, 36, "\r") // Return
+	compose(w, "你", 0, true)
+	eventually(t, "the composed text", func() bool { _, _, n := state(); return n == "你" })
+	if o, s, _ := state(); !o || s != 0 {
+		t.Fatalf("keys typed while composing: the dialog open %v, the input submitted %d times", o, s)
+	}
+	pressKey(w, 53, "\x1b")
+	eventually(t, "Escape closing the dialog", func() bool { o, _, _ := state(); return !o })
+}
+
 // TestContentWindow shows native UI: frames, input from the platform,
 // Update, capture, and page methods that fail.
 func TestContentWindow(t *testing.T) {
@@ -2416,6 +2642,125 @@ func TestContentWindow(t *testing.T) {
 		eventually(t, "the Control-click", func() bool { return rightClicks.Load() == 1 })
 		if clicks.Load() != 2 {
 			t.Errorf("the Control-click clicked: %d clicks", clicks.Load())
+		}
+	}
+}
+
+// TestContentWindowLazyGPU gives a window of native UI drawing in memory
+// the GPU, as its content asks once that costs too much: on Linux, its
+// GtkGLArea, which has no context until then, is realized anew and makes
+// one, then shows its frames through OpenGL and still takes clicks, its
+// input window under those of its hidden title bar's controls.
+func TestContentWindowLazyGPU(t *testing.T) {
+	if !lazyGPU(true) {
+		t.Skip("only Linux loads the GPU's driver on demand")
+	}
+	defer lazyGPU(false)
+	var frames, clicks atomic.Int32
+	view := func(c *ui.Context) {
+		frames.Add(1)
+		ui.Box(c).Fill().Background(ui.RGB(30, 144, 255)).Children(func() {
+			if ui.Box(c).Size(200, 100).Background(ui.RGB(255, 0, 0)).Clicked() {
+				clicks.Add(1)
+			}
+		})
+	}
+	w := newWindow(t, mygo.WindowOptions{Title: "Lazy GPU", Width: 400, Height: 300, TitleBarStyle: mygo.TitleBarHidden,
+		Content: ui.View(view)})
+	eventually(t, "a frame", func() bool { return frames.Load() > 0 })
+	if how, _, _, _, _ := glSurface(w); how != "cairo" {
+		t.Fatalf("the surface draws %q before asking for the GPU, not with cairo", how)
+	}
+	if !useGPU(w) {
+		t.Skip("OpenGL draws on the CPU here: set MYGO_GPU=1")
+	}
+	if !surfaceInputLowest(w) {
+		t.Error("the surface's input window went over the title bar's controls")
+	}
+	var pix []byte
+	var gw int
+	eventually(t, "a frame shown through OpenGL", func() bool {
+		var how string
+		how, pix, gw, _, _ = glSurface(w)
+		return how != "cairo" && how != "" && len(pix) > 0
+	})
+	s := deviceScale(w)
+	bgra := func(x, y float64) []byte { return pix[(int(y*s)*gw+int(x*s))*4:][:4] }
+	if c := bgra(100, 50); c[2] < 200 || c[0] > 60 {
+		t.Errorf("the red box is %v (BGRA) in the GtkGLArea", c)
+	}
+	if c := bgra(300, 250); c[0] < 200 || c[2] > 60 {
+		t.Errorf("the background is %v (BGRA) in the GtkGLArea", c)
+	}
+	if !click(w, 100, 50) {
+		t.Skip("click automation not available on this platform")
+	}
+	eventually(t, "the click", func() bool { return clicks.Load() == 1 })
+}
+
+// TestContentWindowRepaintsWhatChanged moves the red row of a window of
+// native UI under a menu bar, and reads what the display shows. On Linux,
+// GTK repaints only what frames drawn in memory changed, which a GtkGLArea
+// tells it where its GdkWindow, its parent's, has it: below the menu bar.
+func TestContentWindowRepaintsWhatChanged(t *testing.T) {
+	if !lazyGPU(true) {
+		t.Skip("only Linux repaints what frames drawn in memory changed")
+	}
+	defer lazyGPU(false)
+	prev := mygo.App.Menu()
+	defer mygo.App.SetMenu(prev)
+	mygo.App.SetMenu(mygo.NewMenu([]*mygo.MenuItem{{Label: "App", Submenu: []*mygo.MenuItem{{Label: "Item"}}}}))
+	var frames, red atomic.Int32
+	view := func(c *ui.Context) {
+		frames.Add(1)
+		ui.Box(c).Fill().Padding(20).Gap(20).Background(ui.RGB(30, 144, 255)).Children(func() {
+			for i := range int32(3) {
+				color := ui.RGB(255, 255, 255)
+				if i == red.Load() {
+					color = ui.RGB(255, 0, 0)
+				}
+				ui.Box(c).Size(300, 40).Background(color)
+			}
+		})
+	}
+	w := newWindow(t, mygo.WindowOptions{Title: "Repaint", Width: 400, Height: 300, Content: ui.View(view)})
+	eventually(t, "a frame", func() bool { return frames.Load() > 0 })
+	s := deviceScale(w)
+	// rows tells what the display shows at the top and the bottom of each
+	// row: r for red, w for white.
+	rows := func() string {
+		b, _ := surfaceOnScreen(w)
+		m, err := png.Decode(bytes.NewReader(b))
+		if err != nil {
+			return ""
+		}
+		shown := ""
+		for i := range 3 {
+			for _, y := range []float64{25, 55} {
+				r, g, _, _ := m.At(int(200*s), int((float64(i*60)+y)*s)).RGBA()
+				switch {
+				case r>>8 > 200 && g>>8 < 60:
+					shown += "r"
+				case r>>8 > 200:
+					shown += "w"
+				default:
+					shown += "?"
+				}
+			}
+		}
+		return shown
+	}
+	for _, to := range []int{2, 0, 1} {
+		before := frames.Load()
+		w.Update(func() { red.Store(int32(to)) })
+		eventually(t, "a frame after Update", func() bool { return frames.Load() > before })
+		want := strings.Repeat("ww", to) + "rr" + strings.Repeat("ww", 2-to)
+		deadline := time.Now().Add(5 * time.Second)
+		for shown := rows(); shown != want; shown = rows() {
+			if time.Now().After(deadline) {
+				t.Fatalf("with row %d red, the display shows %q, not %q", to, shown, want)
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }

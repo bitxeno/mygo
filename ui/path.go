@@ -188,8 +188,14 @@ func (p *Painter) drawPath(f *flatPath, width float32, c Color, g *LinearGradien
 	if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
 		return
 	}
-	// The key covers the shape relative to the pixel grid; a stroke's is
-	// its center line's, and its width.
+	// The key covers the shape relative to the pixel grid, in quarters of
+	// a pixel; a stroke's is its center line's, and its width. The points
+	// move to those quarters, so that the mask of a key is the same
+	// whichever path drew it first: a path looks the same wherever it is
+	// on the grid, whatever drew before it.
+	for i, pt := range f.pts {
+		f.pts[i] = [2]float32{x0 + round((pt[0]-x0)*4)/4, y0 + round((pt[1]-y0)*4)/4}
+	}
 	key := uint64(1)
 	if hw > 0 {
 		key = 2 + uint64(math.Float32bits(hw))<<8
@@ -222,13 +228,15 @@ func (p *Painter) drawPath(f *flatPath, width float32, c Color, g *LinearGradien
 		return
 	}
 	start := int32(len(p.s.Glyphs))
-	p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{X: x0, Y: y0, W: float32(gi.W), H: float32(gi.H), U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H, Color: c.Alpha(p.opacity).scene()})
+	c = c.Alpha(p.opacity)
+	p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{X: x0, Y: y0, W: float32(gi.W), H: float32(gi.H), U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H, Color: c.scene(), Wide: p.glyphWide(c)})
 	op := scene.Op{Kind: scene.OpGlyphs, Start: start, End: start + 1}
 	if g != nil {
 		// The gradient spans the path's bounds.
 		op.Rect = scene.Rect{X: minX - hw, Y: minY - hw, W: maxX - minX + 2*hw, H: maxY - minY + 2*hw}
 		op.Opacity = p.opacity
 		p.gradient(&op, *g)
+		op.Wide = p.wide(g.From, g.To, Color{})
 	}
 	p.s.Ops = append(p.s.Ops, op)
 }

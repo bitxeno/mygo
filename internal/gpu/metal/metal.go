@@ -15,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -29,6 +31,21 @@ import (
 
 //go:embed shader.metal
 var shaderSource string
+
+// effectSource is the head and the tail of an effect's library, around
+// the line "// effect" (see EffectSource).
+//
+//go:embed effect.metal
+var effectSource string
+
+// EffectSource returns the source of an effect's library: shader.metal
+// with EFFECT defined, the head of effect.metal, the effect's shader (see
+// scene.Effect), and the tail, which draws its instances with it
+// (effect_ps). Effects compile it ahead of time with CompileLibrary.
+func EffectSource(src string) string {
+	head, tail, _ := strings.Cut(effectSource, "\n// effect\n")
+	return "#define EFFECT\n" + shaderSource + "\n" + head + "\n" + src + "\n" + tail
+}
 
 type id = uintptr
 
@@ -45,11 +62,16 @@ const (
 	pixelFormatR8Unorm    = 10
 	pixelFormatRGBA8Unorm = 70
 	pixelFormatBGRA8Unorm = 80
+	// pixelFormatRGBA16Float holds the components of wide colors, which
+	// leave 0 to 1.
+	pixelFormatRGBA16Float = 115
 
 	usageShaderRead   = 1
 	usageRenderTarget = 4
 	storageManaged    = 1
 
+	loadActionDontCare     = 0
+	loadActionLoad         = 1
 	loadActionClear        = 2
 	storeActionStore       = 1
 	primitiveTriStrip      = 4
@@ -70,6 +92,7 @@ var (
 	poolPush, poolPop uintptr
 	createDevice      func() id
 	srgb              uintptr
+	extendedSRGB      uintptr
 	msgReplaceRegion  func(obj id, sel objc.SEL, r mtlRegion, level uint, bytes unsafe.Pointer, bytesPerRow uint)
 	msgGetBytes       func(obj id, sel objc.SEL, bytes unsafe.Pointer, bytesPerRow uint, r mtlRegion, level uint)
 	msgSetScissor     func(obj id, sel objc.SEL, r mtlScissorRect)
@@ -136,6 +159,7 @@ func load() error {
 		poolPop = sym(objcLib, "objc_autoreleasePoolPop")
 		create := sym(metalLib, "MTLCreateSystemDefaultDevice")
 		name := sym(cg, "kCGColorSpaceSRGB")
+		extendedName := sym(cg, "kCGColorSpaceExtendedSRGB")
 		colorSpace := sym(cg, "CGColorSpaceCreateWithName")
 		system := lib("/usr/lib/libSystem.B.dylib")
 		cf := lib("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
@@ -186,6 +210,7 @@ func load() error {
 		purego.RegisterFunc(&msgSetFloat, msgSend)
 		purego.RegisterFunc(&msgRect, stret)
 		srgb, _, _ = purego.SyscallN(colorSpace, *(*uintptr)(ptr(name)))
+		extendedSRGB, _, _ = purego.SyscallN(colorSpace, *(*uintptr)(ptr(extendedName)))
 	})
 	return errLoad
 }
@@ -284,9 +309,33 @@ type texture struct {
 	lastFrame uint64
 }
 
+// formatState is what a renderer draws into targets of a pixel format
+// with.
+type formatState struct {
+	format   uint
+	pipeline id
+	// downPipe and blurPipe draw the passes computing the backdrops of
+	// effects, into the textures of backdrop, the second only along rows.
+	downPipe, blurPipe id
+	backdrop           [2]texture
+	// effects are the pipelines of the effects drawn, made as first drawn.
+	effects map[*scene.Effect]*effectPipe
+}
+
 // Renderer draws scenes into a CAMetalLayer it adds to a view's layer.
 type Renderer struct {
-	device, queue, pipeline, sampler id
+	device, queue, sampler id
+	// formats has what draws into BGRA8 targets, as frames do, and into
+	// RGBA16Float ones, as frames showing colors outside the sRGB gamut do
+	// (SetWide), made for the first of those; cur is that of the target
+	// drawn into.
+	formats [2]formatState
+	cur     *formatState
+	// wide tells that frames show the colors of scenes outside the sRGB
+	// gamut, and layerWide that the layer's drawables hold them; wideErr
+	// is why they cannot.
+	wide, layerWide bool
+	wideErr         error
 	// layer is the CAMetalLayer in superlayer, the view's.
 	layer, superlayer id
 	w, h              int
@@ -380,6 +429,8 @@ func newRenderer() (r *Renderer, err error) {
 		return nil, err
 	}
 	r = &Renderer{images: map[uint64]*texture{}}
+	r.formats = [2]formatState{{format: pixelFormatBGRA8Unorm}, {format: pixelFormatRGBA16Float}}
+	r.cur = &r.formats[0]
 	pool(func() { err = r.init() })
 	if err != nil {
 		r.Release()
@@ -388,7 +439,7 @@ func newRenderer() (r *Renderer, err error) {
 	return r, nil
 }
 
-func (r *Renderer) init() error {
+func (r *Renderer) init() (err error) {
 	r.device = createDevice() // owned: NS_RETURNS_RETAINED
 	if err := need(r.device, "Metal device", "newCommandQueue", "newLibraryWithSource:options:error:",
 		"newRenderPipelineStateWithDescriptor:error:", "newSamplerStateWithDescriptor:", "newTextureWithDescriptor:",
@@ -399,40 +450,8 @@ func (r *Renderer) init() error {
 	if r.queue == 0 {
 		return errors.New("metal: no command queue")
 	}
-	var errObj id
-	lib := r.compiledLibrary()
-	if lib == 0 {
-		lib = send(r.device, "newLibraryWithSource:options:error:", nsString(shaderSource), 0, uintptr(unsafe.Pointer(&errObj)))
-	}
-	if lib == 0 {
-		return fmt.Errorf("metal: cannot compile the shader: %s", describe(errObj))
-	}
-	defer release(&lib)
-	vs := send(lib, "newFunctionWithName:", nsString("vs"))
-	defer release(&vs)
-	ps := send(lib, "newFunctionWithName:", nsString("ps"))
-	defer release(&ps)
-	if vs == 0 || ps == 0 {
-		return errors.New("metal: the shader has no vs or ps")
-	}
-	desc := send(send(class("MTLRenderPipelineDescriptor"), "alloc"), "init")
-	defer release(&desc)
-	send(desc, "setVertexFunction:", vs)
-	send(desc, "setFragmentFunction:", ps)
-	ca := send(send(desc, "colorAttachments"), "objectAtIndexedSubscript:", 0)
-	send(ca, "setPixelFormat:", pixelFormatBGRA8Unorm)
-	// Premultiplied colors over what is drawn.
-	send(ca, "setBlendingEnabled:", 1)
-	send(ca, "setSourceRGBBlendFactor:", blendOne)
-	// Dual-source blending: the shader's second color is the source's
-	// alpha of each channel.
-	send(ca, "setDestinationRGBBlendFactor:", blendOneMinusSrc1Color)
-	send(ca, "setSourceAlphaBlendFactor:", blendOne)
-	send(ca, "setDestinationAlphaBlendFactor:", blendOneMinusSrc1A)
-	errObj = 0
-	r.pipeline = send(r.device, "newRenderPipelineStateWithDescriptor:error:", desc, uintptr(unsafe.Pointer(&errObj)))
-	if r.pipeline == 0 {
-		return fmt.Errorf("metal: cannot create the pipeline: %s", describe(errObj))
+	if err := r.makePipelines(r.cur); err != nil {
+		return err
 	}
 	sd := send(send(class("MTLSamplerDescriptor"), "alloc"), "init")
 	defer release(&sd)
@@ -445,15 +464,193 @@ func (r *Renderer) init() error {
 	return nil
 }
 
+// makePipelines makes the pipelines of f's format, or none.
+func (r *Renderer) makePipelines(f *formatState) (err error) {
+	var errObj id
+	lib := r.compiledLibrary()
+	if lib == 0 {
+		lib = send(r.device, "newLibraryWithSource:options:error:", nsString(shaderSource), 0, uintptr(unsafe.Pointer(&errObj)))
+	}
+	if lib == 0 {
+		return fmt.Errorf("metal: cannot compile the shader: %s", describe(errObj))
+	}
+	defer release(&lib)
+	defer func() {
+		if err != nil {
+			release(&f.pipeline)
+			release(&f.downPipe)
+			release(&f.blurPipe)
+		}
+	}()
+	if f.pipeline, err = r.newPipeline(lib, "ps", f.format); err != nil {
+		return err
+	}
+	if f.downPipe, err = r.passPipeline(lib, "down", f.format); err != nil {
+		return err
+	}
+	f.blurPipe, err = r.passPipeline(lib, "blur", f.format)
+	return err
+}
+
+// SetWide has the frames drawn from now on show the colors of scenes
+// outside the sRGB gamut (scene.Scene.Wide), into drawables of RGBA16Float
+// in the extended sRGB color space, which keeps components beyond 0 to 1
+// and which the system shows in the display's gamut, or their nearest sRGB
+// colors, into drawables of BGRA8, as without; and reports whether they
+// do. The pipelines drawing the wide colors are made the first time.
+func (r *Renderer) SetWide(on bool) bool {
+	f := &r.formats[1]
+	if on && f.pipeline == 0 && r.wideErr == nil {
+		r.wideErr = errors.New("metal: no extended sRGB color space")
+		if extendedSRGB != 0 {
+			pool(func() { r.wideErr = r.makePipelines(f) })
+		}
+		if r.wideErr != nil {
+			fmt.Fprintf(os.Stderr, "%v: drawing the nearest sRGB colors\n", r.wideErr)
+		}
+	}
+	r.wide = on && r.wideErr == nil
+	return r.wide
+}
+
+// setLayerWide has the layer's drawables hold the colors outside the sRGB
+// gamut, or not: the system makes others, which hold no frame drawn in
+// memory.
+func (r *Renderer) setLayerWide(on bool) {
+	if r.layerWide == on || r.layer == 0 {
+		return
+	}
+	format, space := uintptr(pixelFormatBGRA8Unorm), srgb
+	if on {
+		format, space = pixelFormatRGBA16Float, extendedSRGB
+	}
+	tx := class("CATransaction")
+	send(tx, "begin")
+	send(tx, "setDisableActions:", 1)
+	send(r.layer, "setPixelFormat:", format)
+	send(r.layer, "setColorspace:", space)
+	send(tx, "commit")
+	r.layerWide = on
+	clear(r.shown)
+}
+
+// newPipeline returns a pipeline drawing instances with the vertex
+// function vs and the fragment function fs of lib, blending premultiplied
+// colors over what is drawn.
+func (r *Renderer) newPipeline(lib id, fs string, format uint) (id, error) {
+	vsFn := send(lib, "newFunctionWithName:", nsString("vs"))
+	defer release(&vsFn)
+	fsFn := send(lib, "newFunctionWithName:", nsString(fs))
+	defer release(&fsFn)
+	if vsFn == 0 || fsFn == 0 {
+		return 0, fmt.Errorf("metal: the shader has no vs or %s", fs)
+	}
+	desc := send(send(class("MTLRenderPipelineDescriptor"), "alloc"), "init")
+	defer release(&desc)
+	send(desc, "setVertexFunction:", vsFn)
+	send(desc, "setFragmentFunction:", fsFn)
+	ca := send(send(desc, "colorAttachments"), "objectAtIndexedSubscript:", 0)
+	send(ca, "setPixelFormat:", uintptr(format))
+	// Premultiplied colors over what is drawn.
+	send(ca, "setBlendingEnabled:", 1)
+	send(ca, "setSourceRGBBlendFactor:", blendOne)
+	// Dual-source blending: the shader's second color is the source's
+	// alpha of each channel.
+	send(ca, "setDestinationRGBBlendFactor:", blendOneMinusSrc1Color)
+	send(ca, "setSourceAlphaBlendFactor:", blendOne)
+	send(ca, "setDestinationAlphaBlendFactor:", blendOneMinusSrc1A)
+	var errObj id
+	pipe := send(r.device, "newRenderPipelineStateWithDescriptor:error:", desc, uintptr(unsafe.Pointer(&errObj)))
+	if pipe == 0 {
+		return 0, fmt.Errorf("metal: cannot create the %s pipeline: %s", fs, describe(errObj))
+	}
+	return pipe, nil
+}
+
+// effectPipe is the pipeline of an effect, or why it has none.
+type effectPipe struct {
+	pipe id
+	err  error
+}
+
+// effectPipeline returns the pipeline of e: from the library e compiled
+// ahead of time, unless it was compiled from another source, as when the
+// renderer's head or tail changed since, which it then compiles. It is 0
+// for an effect that does not compile, which draws nothing.
+func (r *Renderer) effectPipeline(e *scene.Effect) id {
+	f := r.cur
+	if p := f.effects[e]; p != nil {
+		return p.pipe
+	}
+	p := &effectPipe{}
+	if f.effects == nil {
+		f.effects = map[*scene.Effect]*effectPipe{}
+	}
+	f.effects[e] = p
+	src := EffectSource(e.Metal.Source)
+	var lib id
+	if len(e.Metal.Compiled) > 0 && e.Metal.Sum == gpu.SourceSum(src) {
+		lib = r.libraryFromData(e.Metal.Compiled)
+	}
+	if lib == 0 {
+		var errObj id
+		if lib = send(r.device, "newLibraryWithSource:options:error:", nsString(src), 0, uintptr(unsafe.Pointer(&errObj))); lib == 0 {
+			p.err = fmt.Errorf("metal: cannot compile the effect %s: %s", e.Name, describe(errObj))
+		}
+	}
+	if lib != 0 {
+		p.pipe, p.err = r.newPipeline(lib, "effect_ps", f.format)
+		release(&lib)
+	}
+	if p.err != nil && r.err == nil {
+		// Shown once, as frames go on without the effect.
+		fmt.Fprintln(os.Stderr, p.err)
+	}
+	return p.pipe
+}
+
+// passPipeline returns the pipeline of a pass computing backdrops, which
+// draws the fragment function name of lib over its target, unblended.
+func (r *Renderer) passPipeline(lib id, name string, format uint) (id, error) {
+	vs := send(lib, "newFunctionWithName:", nsString("passVS"))
+	defer release(&vs)
+	fs := send(lib, "newFunctionWithName:", nsString(name))
+	defer release(&fs)
+	if vs == 0 || fs == 0 {
+		return 0, fmt.Errorf("metal: the shader has no passVS or %s", name)
+	}
+	desc := send(send(class("MTLRenderPipelineDescriptor"), "alloc"), "init")
+	defer release(&desc)
+	send(desc, "setVertexFunction:", vs)
+	send(desc, "setFragmentFunction:", fs)
+	ca := send(send(desc, "colorAttachments"), "objectAtIndexedSubscript:", 0)
+	send(ca, "setPixelFormat:", uintptr(format))
+	var errObj id
+	pipe := send(r.device, "newRenderPipelineStateWithDescriptor:error:", desc, uintptr(unsafe.Pointer(&errObj)))
+	if pipe == 0 {
+		return 0, fmt.Errorf("metal: cannot create the %s pipeline: %s", name, describe(errObj))
+	}
+	return pipe, nil
+}
+
 // compiledLibrary returns the library compiled from the shader ahead of
 // time, or 0 when it was compiled from another shader.metal (go generate
 // was not run since it changed) or Metal cannot load it.
 func (r *Renderer) compiledLibrary() id {
-	if gpu.SourceSum(shaderSource) != shaderLibrarySum || dispatchDataCreate == 0 || !respondsTo(r.device, "newLibraryWithData:error:") {
+	if gpu.SourceSum(shaderSource) != shaderLibrarySum {
+		return 0
+	}
+	return r.libraryFromData(shaderLibrary)
+}
+
+// libraryFromData returns a library loaded from the code of one, or 0
+// when Metal cannot load it.
+func (r *Renderer) libraryFromData(code []byte) id {
+	if dispatchDataCreate == 0 || !respondsTo(r.device, "newLibraryWithData:error:") {
 		return 0
 	}
 	// Without a destructor, dispatch_data_create copies the bytes.
-	data, _, _ := purego.SyscallN(dispatchDataCreate, uintptr(unsafe.Pointer(&shaderLibrary[0])), uintptr(len(shaderLibrary)), 0, 0)
+	data, _, _ := purego.SyscallN(dispatchDataCreate, uintptr(unsafe.Pointer(&code[0])), uintptr(len(code)), 0, 0)
 	if data == 0 {
 		return 0
 	}
@@ -552,6 +749,7 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 	if err := r.syncAtlas(&r.color, s.ColorAtlas, pixelFormatRGBA8Unorm); err != nil {
 		return 0, err
 	}
+	r.b.Wide = r.cur.format == pixelFormatRGBA16Float
 	r.b.Build(s, r.imageTexture)
 	if n := len(r.b.Instances); n > r.instCap {
 		release(&r.instBuf)
@@ -568,39 +766,20 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 		copy(dst, r.b.Instances)
 	}
 
-	rpd := send(class("MTLRenderPassDescriptor"), "renderPassDescriptor")
-	ca := send(send(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0)
-	send(ca, "setTexture:", target)
-	send(ca, "setLoadAction:", loadActionClear)
-	send(ca, "setStoreAction:", storeActionStore)
-	c := s.Clear.Premul(1)
-	msgSetClearColor(ca, sel("setClearColor:"), mtlClearColor{float64(c[0]), float64(c[1]), float64(c[2]), float64(c[3])})
+	if err := r.fitBackdrop(); err != nil {
+		return 0, err
+	}
 	cb := send(r.queue, "commandBuffer")
 	if !r.checked {
 		if err := need(cb, "command buffer", "renderCommandEncoderWithDescriptor:", "commit", "waitUntilScheduled", "waitUntilCompleted", "status", "blitCommandEncoder"); err != nil {
 			return 0, err
 		}
 	}
-	enc := send(cb, "renderCommandEncoderWithDescriptor:", rpd)
-	if !r.checked {
-		if err := need(enc, "render encoder", "setRenderPipelineState:", "setVertexBytes:length:atIndex:", "setVertexBuffer:offset:atIndex:",
-			"setFragmentBuffer:offset:atIndex:", "setFragmentTexture:atIndex:", "setFragmentSamplerState:atIndex:", "setScissorRect:",
-			"drawPrimitives:vertexStart:vertexCount:instanceCount:", "endEncoding"); err != nil {
-			if enc != 0 {
-				send(enc, "endEncoding")
-			}
-			return 0, err
-		}
-		r.checked = true
+	enc, err := r.begin(cb, target, loadActionClear, s)
+	if err != nil {
+		return 0, err
 	}
-	send(enc, "setRenderPipelineState:", r.pipeline)
-	globals := [4]float32{float32(s.Width), float32(s.Height), 0, 0}
-	send(enc, "setVertexBytes:length:atIndex:", uintptr(unsafe.Pointer(&globals[0])), unsafe.Sizeof(globals), 1)
-	send(enc, "setFragmentSamplerState:atIndex:", r.sampler, 0)
-	send(enc, "setFragmentTexture:atIndex:", or(r.mask.tex, r.empty), 0)
-	send(enc, "setFragmentTexture:atIndex:", or(r.color.tex, r.empty), 1)
-	send(enc, "setFragmentTexture:atIndex:", r.empty, 2)
-	bound := r.empty
+	bound, pipe := r.empty, r.cur.pipeline
 	for _, b := range r.b.Batches {
 		// Metal requires scissor rectangles within the target.
 		sc := b.Scissor
@@ -608,6 +787,26 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 		sc.Right, sc.Bottom = min(sc.Right, int32(s.Width)), min(sc.Bottom, int32(s.Height))
 		if b.Count == 0 || sc.Empty() {
 			continue
+		}
+		want := r.cur.pipeline
+		if b.Effect != nil {
+			if want = r.effectPipeline(b.Effect); want == 0 {
+				continue
+			}
+		}
+		if b.Backdrop != 0 {
+			// The effect shows what is drawn so far.
+			send(enc, "endEncoding")
+			r.readBackdrop(cb, target, r.b.Backdrops[b.Backdrop-1])
+			if enc, err = r.begin(cb, target, loadActionLoad, s); err != nil {
+				return 0, err
+			}
+			send(enc, "setFragmentTexture:atIndex:", r.cur.backdrop[0].tex, 3)
+			bound, pipe = r.empty, r.cur.pipeline
+		}
+		if want != pipe {
+			pipe = want
+			send(enc, "setRenderPipelineState:", pipe)
 		}
 		if b.Image != 0 && b.Image != bound {
 			bound = b.Image
@@ -621,6 +820,101 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 	}
 	send(enc, "endEncoding")
 	return cb, nil
+}
+
+// begin starts encoding the drawing of s into target, which it clears or
+// keeps (load), with the state the instances draw with.
+func (r *Renderer) begin(cb, target id, load uintptr, s *scene.Scene) (id, error) {
+	rpd := send(class("MTLRenderPassDescriptor"), "renderPassDescriptor")
+	ca := send(send(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0)
+	send(ca, "setTexture:", target)
+	send(ca, "setLoadAction:", load)
+	send(ca, "setStoreAction:", storeActionStore)
+	c := s.Clear.Premul(1)
+	msgSetClearColor(ca, sel("setClearColor:"), mtlClearColor{float64(c[0]), float64(c[1]), float64(c[2]), float64(c[3])})
+	enc := send(cb, "renderCommandEncoderWithDescriptor:", rpd)
+	if !r.checked {
+		if err := need(enc, "render encoder", "setRenderPipelineState:", "setVertexBytes:length:atIndex:", "setVertexBuffer:offset:atIndex:",
+			"setFragmentBuffer:offset:atIndex:", "setFragmentBytes:length:atIndex:", "setFragmentTexture:atIndex:", "setFragmentSamplerState:atIndex:",
+			"setScissorRect:", "drawPrimitives:vertexStart:vertexCount:instanceCount:", "endEncoding"); err != nil {
+			if enc != 0 {
+				send(enc, "endEncoding")
+			}
+			return 0, err
+		}
+		r.checked = true
+	}
+	send(enc, "setRenderPipelineState:", r.cur.pipeline)
+	// The frame's size, and whether its target keeps colors outside the
+	// sRGB gamut.
+	globals := [4]float32{float32(s.Width), float32(s.Height), 0, 0}
+	if r.b.Wide {
+		globals[2] = 1
+	}
+	send(enc, "setVertexBytes:length:atIndex:", uintptr(unsafe.Pointer(&globals[0])), unsafe.Sizeof(globals), 1)
+	send(enc, "setFragmentBytes:length:atIndex:", uintptr(unsafe.Pointer(&globals[0])), unsafe.Sizeof(globals), 1)
+	send(enc, "setFragmentSamplerState:atIndex:", r.sampler, 0)
+	send(enc, "setFragmentTexture:atIndex:", or(r.mask.tex, r.empty), 0)
+	send(enc, "setFragmentTexture:atIndex:", or(r.color.tex, r.empty), 1)
+	send(enc, "setFragmentTexture:atIndex:", r.empty, 2)
+	send(enc, "setFragmentTexture:atIndex:", r.empty, 3)
+	return enc, nil
+}
+
+// readBackdrop encodes the passes computing the backdrop bk of what
+// target holds, into r.cur.backdrop[0].
+func (r *Renderer) readBackdrop(cb, target id, bk scene.Backdrop) {
+	f := r.cur
+	w, h := bk.Size()
+	p := gpu.DownPass(bk, [2]int32{})
+	r.pass(cb, f.downPipe, target, f.backdrop[0].tex, w, h, &p)
+	if bk.Radius == 0 {
+		return
+	}
+	p = gpu.BlurPass(bk, [2]int32{1, 0})
+	r.pass(cb, f.blurPipe, f.backdrop[0].tex, f.backdrop[1].tex, w, h, &p)
+	p = gpu.BlurPass(bk, [2]int32{0, 1})
+	r.pass(cb, f.blurPipe, f.backdrop[1].tex, f.backdrop[0].tex, w, h, &p)
+}
+
+// pass encodes drawing the w×h texels at the start of dst with pipe,
+// which reads src.
+func (r *Renderer) pass(cb, pipe, src, dst id, w, h int, p *gpu.Pass) {
+	rpd := send(class("MTLRenderPassDescriptor"), "renderPassDescriptor")
+	ca := send(send(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0)
+	send(ca, "setTexture:", dst)
+	send(ca, "setLoadAction:", loadActionDontCare)
+	send(ca, "setStoreAction:", storeActionStore)
+	enc := send(cb, "renderCommandEncoderWithDescriptor:", rpd)
+	send(enc, "setRenderPipelineState:", pipe)
+	send(enc, "setFragmentTexture:atIndex:", src, 0)
+	send(enc, "setFragmentBytes:length:atIndex:", uintptr(unsafe.Pointer(p)), unsafe.Sizeof(*p), 0)
+	msgSetScissor(enc, sel("setScissorRect:"), mtlScissorRect{0, 0, uint(w), uint(h)})
+	send(enc, "drawPrimitives:vertexStart:vertexCount:instanceCount:", primitiveTriStrip, 0, 4, 1)
+	send(enc, "endEncoding")
+}
+
+// fitBackdrop makes the textures of backdrops as large as the scene built
+// needs.
+func (r *Renderer) fitBackdrop() error {
+	f := r.cur
+	w, h := r.b.BackdropSize()
+	if w == 0 || f.backdrop[0].w >= w && f.backdrop[0].h >= h {
+		return nil
+	}
+	// Somewhat larger, so that a pane growing does not make them again
+	// every frame.
+	w, h = max(w+w/4, f.backdrop[0].w), max(h+h/4, f.backdrop[0].h)
+	for i := range f.backdrop {
+		t := &f.backdrop[i]
+		release(&t.tex)
+		if t.tex = r.newTexture(w, h, f.format, usageRenderTarget|usageShaderRead, nil, 0); t.tex == 0 {
+			t.w, t.h = 0, 0
+			return errors.New("metal: cannot create a backdrop texture")
+		}
+		t.w, t.h = w, h
+	}
+	return nil
 }
 
 func or(a, b id) id {
@@ -648,6 +942,11 @@ func (r *Renderer) render(s *scene.Scene) error {
 	if scale <= 0 {
 		scale = 1
 	}
+	r.cur = &r.formats[0]
+	if r.wide {
+		r.cur = &r.formats[1]
+	}
+	r.setLayerWide(r.wide)
 	r.fit(s.Width, s.Height, scale)
 	drawable := send(r.layer, "nextDrawable")
 	if drawable == 0 {
@@ -731,6 +1030,7 @@ func (r *Renderer) presentPixels(pix []byte, stride, width, height int, scale fl
 	if scale <= 0 {
 		scale = 1
 	}
+	r.setLayerWide(false)
 	r.fit(width, height, scale)
 	r.pixelFrames++
 	n := r.pixelFrames
@@ -781,6 +1081,12 @@ func (r *Renderer) releaseTextures() {
 	}
 	release(&r.instBuf)
 	r.instCap = 0
+	for i := range r.formats {
+		for j := range r.formats[i].backdrop {
+			release(&r.formats[i].backdrop[j].tex)
+			r.formats[i].backdrop[j] = texture{}
+		}
+	}
 }
 
 // changedSince returns what changed between the frame drawn in memory the
@@ -873,6 +1179,7 @@ func (r *Renderer) trim() {
 func (r *Renderer) renderOffscreen(s *scene.Scene) (pix []byte, err error) {
 	pool(func() {
 		r.waitLast()
+		r.cur = &r.formats[0]
 		tex := r.newTexture(s.Width, s.Height, pixelFormatBGRA8Unorm, usageRenderTarget|usageShaderRead, nil, 0)
 		if tex == 0 {
 			err = errors.New("metal: cannot create a target")
@@ -920,7 +1227,15 @@ func (r *Renderer) Release() {
 		r.releaseTextures()
 		release(&r.empty)
 		release(&r.sampler)
-		release(&r.pipeline)
+		for i := range r.formats {
+			f := &r.formats[i]
+			release(&f.pipeline)
+			release(&f.downPipe)
+			release(&f.blurPipe)
+			for _, p := range f.effects {
+				release(&p.pipe)
+			}
+		}
 		release(&r.queue)
 		release(&r.device)
 	})

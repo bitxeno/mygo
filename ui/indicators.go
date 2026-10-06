@@ -16,12 +16,14 @@ func Spinner(c *Context) *Element {
 	e := Box(c).Size(size, size).Shrink(0).Role(RoleProgress)
 	e.widget = "Spinner"
 	e.hasRange, e.accRange = true, [3]float64{0, 1, -1}
-	c.AnimationFrame()
-	now := c.now
 	e.Draw(func(p *Painter, r Rect) {
-		const spokes = 12
-		// A spoke a twelfth of a turn on every twelfth of 0.9 s.
-		lead := int(now.UnixMilli()%900) * spokes / 900
+		// A spoke a twelfth of a turn on every twelfth of 0.9 s: it is
+		// painted again for the next, while it shows, without building the
+		// view.
+		const spokes, turn = 12, 900
+		ms := int(p.Now().UnixMilli() % turn)
+		lead := ms * spokes / turn
+		p.After(time.Duration((lead+1)*turn/spokes-ms) * time.Millisecond)
 		cx, cy := r.X+r.W/2, r.Y+r.H/2
 		in, out, w := r.W*0.22, r.W*0.46, r.W*0.09
 		for i := range spokes {
@@ -105,7 +107,7 @@ func Rating(c *Context, value *int, max int) *Element {
 	case e.Shortcut(0, KeyEnd):
 		set(max)
 	}
-	e.hasRange, e.accRange = true, [3]float64{0, float64(max), float64(*value)}
+	e.hasRange, e.accRange, e.accStep = true, [3]float64{0, float64(max), float64(*value)}, 1
 	// The stars the pointer would set, shown as it rests on them.
 	hover := -1
 	e.Children(func() {
@@ -203,7 +205,7 @@ func Stepper(c *Context, value *float64, lo, hi, step float64) *Element {
 	case e.Shortcut(0, KeyEnd):
 		set(hi)
 	}
-	e.hasRange, e.accRange = true, [3]float64{lo, hi, *value}
+	e.hasRange, e.accRange, e.accStep = true, [3]float64{lo, hi, *value}, step
 	e.Children(func() {
 		for _, up := range []bool{true, false} {
 			arrow := Box(c).Height(t.Space(3.5)).Role(RoleNone)
@@ -318,7 +320,7 @@ func RangeSlider(c *Context, low, high *float64, lo, hi, step float64) *Element 
 			knob.inset[3] = percent(frac * 100)
 			knob.Margin(0, 0, 0, -frac*kw)
 			knob.flags |= flagDraggable | flagHover
-			knob.hasRange, knob.accRange = true, [3]float64{lo, hi, *v}
+			knob.hasRange, knob.accRange, knob.accStep = true, [3]float64{lo, hi, *v}, keyStep
 			// Named after the slider, as "Price minimum".
 			knob.label, knob.nameFrom, knob.nameJoin = []string{"minimum", "maximum"}[k], e, true
 			switch {
@@ -337,7 +339,7 @@ func RangeSlider(c *Context, low, high *float64, lo, hi, step float64) *Element 
 			knobs[k] = knob
 		}
 	})
-	if st.pressed || knobs[0].st.pressed || knobs[1].st.pressed {
+	if (st.pressed || knobs[0].st.pressed || knobs[1].st.pressed) && !e.disabled() {
 		x := at()
 		if *dragging < 0 {
 			// The nearest knob, the high one when they meet past it.

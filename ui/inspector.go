@@ -182,6 +182,17 @@ func (in *inspector) lap(phase int) {
 	in.lapAt = now
 }
 
+// repainted notes a frame that painted the elements of the last one again
+// (engine.repaintFrame), which took d.
+func (in *inspector) repainted(d time.Duration) {
+	if !in.open {
+		return
+	}
+	in.times = [3]time.Duration{0, 0, d}
+	in.history[in.frames%inspHistory] = in.times
+	in.frames++
+}
+
 // toggleInspector opens or closes the inspector.
 func (rt *engine) toggleInspector() {
 	in := &rt.insp
@@ -507,6 +518,18 @@ func roleName(r Role) string {
 		return "Stepper"
 	case RoleColorWell:
 		return "ColorWell"
+	case RoleMenu:
+		return "Menu"
+	case RoleMenuBar:
+		return "MenuBar"
+	case RoleMenuItem:
+		return "MenuItem"
+	case RoleMenuItemCheckBox:
+		return "MenuItemCheckbox"
+	case RoleMenuItemRadio:
+		return "MenuItemRadio"
+	case RoleHeading:
+		return "Heading"
 	}
 	return ""
 }

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/plugins/glass"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -84,6 +85,11 @@ type gallery struct {
 	findQuery                                  string
 	notifyMail, notifyCalendar, notifyMessages bool
 	pathAt, pathDepth                          int
+	// The Glass page's style, what is under its toolbar (a bar of glass,
+	// a soft or hard scroll edge, or a progressive blur), and where its
+	// lens is.
+	glassStyle, glassEdge int
+	lens                  [2]float32
 	// The meeting's day and time, and the tint of its text.
 	meeting time.Time
 	tint    ui.Color
@@ -243,7 +249,7 @@ func makeMessage(id int) message {
 	return message{id: id, text: strings.Join(lines, " "), mine: r%3 == 0}
 }
 
-var pages = []string{"Overview", "Controls", "Text", "List", "Styling", "Drawing", "Overlays", "Motion"}
+var pages = []string{"Overview", "Controls", "Text", "List", "Styling", "Drawing", "Glass", "Overlays", "Motion"}
 
 // icon parses the shapes of a 24×24 stroked icon, drawn in currentColor
 // as icon sets draw them.
@@ -260,6 +266,7 @@ var (
 		"List":     icon(`<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>`),
 		"Styling":  icon(`<path d="M12 21a9 9 0 1 1 9-9c0 2.5-2 3.5-3.5 3.5H16a2 2 0 0 0-1.5 3.3c.4.5.4 2.2-2.5 2.2z"/><circle cx="7.5" cy="11" r="1"/><circle cx="11" cy="7" r="1"/><circle cx="16" cy="8.5" r="1"/>`),
 		"Drawing":  icon(`<path d="M15 5l4 4M4 20l1-4.5L16.5 4a2.1 2.1 0 0 1 3 3L8 18.5z"/>`),
+		"Glass":    icon(`<rect x="3" y="6" width="18" height="12" rx="6"/><path d="M7 10.5a3 3 0 0 1 2.5-1.5"/>`),
 		"Overlays": icon(`<path d="M12 3 3 8l9 5 9-5z"/><path d="m3 13 9 5 9-5"/>`),
 		"Motion":   icon(`<path d="M3 12h4M5 7h6M5 17h6"/><circle cx="16" cy="12" r="5"/>`),
 	}
@@ -327,6 +334,8 @@ func (g *gallery) view(c *ui.Context) {
 						g.styling(c)
 					case "Drawing":
 						g.drawing(c)
+					case "Glass":
+						g.glassPage(c)
 					case "Overlays":
 						g.overlays(c)
 					case "Motion":
@@ -440,6 +449,75 @@ func card(c *ui.Context, title string, body func()) *ui.Element {
 			ui.Text(c, title).FontSize(15).Bold()
 		}
 		body()
+	})
+}
+
+// wideColors draws what each kind of color paints (fills, gradients,
+// stripes, text, shadows) in the sRGB color nearest to an Oklch one, on the
+// left, and in the Oklch color itself, on the right. Where the window draws
+// a wide gamut (a Display P3 screen on macOS) the right column is the more
+// vivid; elsewhere the two match.
+func wideColors(c *ui.Context) {
+	t := c.Theme()
+	vivid, warm := ui.Oklch(0.85, 0.3, 145), ui.Oklch(0.7, 0.3, 30)
+	black := ui.RGB(0, 0, 0)
+	ui.Text(c, "Compare the columns on a Display P3 screen: the right one is more vivid.").FontSize(12).TextColor(t.TextMuted)
+
+	// pair builds a sample twice, in sRGB and then in Oklch, in equal columns.
+	pair := func(sample func(wide bool) *ui.Element) {
+		ui.Row(c).Gap(12).Children(func() {
+			for _, wide := range []bool{false, true} {
+				sample(wide).Basis(0).Grow(1)
+			}
+		})
+	}
+	box := func(label string) *ui.Element {
+		return ui.Row(c).Height(30).Radius(6).Center().Children(func() {
+			ui.Text(c, label).FontSize(12).Bold().TextColor(black)
+		})
+	}
+
+	pair(func(wide bool) *ui.Element {
+		if wide {
+			return ui.Text(c, "Oklch").FontSize(12).Bold().TextColor(t.TextMuted)
+		}
+		return ui.Text(c, "sRGB").FontSize(12).Bold().TextColor(t.TextMuted)
+	})
+	pair(func(wide bool) *ui.Element {
+		if wide {
+			return box("Fill").Background(vivid)
+		}
+		return box("Fill").Background(vivid.SRGB())
+	})
+	pair(func(wide bool) *ui.Element {
+		if wide {
+			return box("Gradient").LinearGradient(ui.LinearGradient{From: warm, To: vivid, Angle: 90, Oklab: true})
+		}
+		return box("Gradient").LinearGradient(ui.LinearGradient{From: warm.SRGB(), To: vivid.SRGB(), Angle: 90, Oklab: true})
+	})
+	pair(func(wide bool) *ui.Element {
+		white := ui.RGB(255, 255, 255)
+		if wide {
+			return box("Stripes").Background(white).Stripes(vivid, 4, 6, 45)
+		}
+		return box("Stripes").Background(white).Stripes(vivid.SRGB(), 4, 6, 45)
+	})
+	pair(func(wide bool) *ui.Element {
+		return ui.Row(c).Height(30).Radius(6).Center().Background(ui.RGB(20, 20, 20)).Children(func() {
+			text := ui.Text(c, "Text").FontSize(14).Bold()
+			if wide {
+				text.TextColor(vivid)
+			} else {
+				text.TextColor(vivid.SRGB())
+			}
+		})
+	})
+	pair(func(wide bool) *ui.Element {
+		e := box("Shadow").Margin(6).Background(ui.RGB(255, 255, 255))
+		if wide {
+			return e.Shadow(0, 4, 12, 0, vivid)
+		}
+		return e.Shadow(0, 4, 12, 0, vivid.SRGB())
 	})
 }
 
@@ -1092,6 +1170,7 @@ func (g *gallery) styling(c *ui.Context) {
 				ui.Text(c, "Stripes: unavailable").FontSize(12).TextColor(t.TextMuted)
 			})
 		})
+		card(c, "Wide colors (Oklch)", func() { wideColors(c) })
 		card(c, "Text decorations", func() {
 			ui.RichText(c, ui.Span{Text: "Spell checkers mark "}, ui.Span{Text: "mispeled", WavyUnderline: true, DecorationColor: t.Danger},
 				ui.Span{Text: " words with waves."})
@@ -1183,9 +1262,10 @@ func repeat(t ui.Track, n int) []ui.Track {
 
 func (g *gallery) drawing(c *ui.Context) {
 	t := c.Theme()
-	ui.Text(c, "Element.Draw paints with rectangles, shadows, paths and text.").TextColor(t.TextMuted)
+	ui.Text(c, "Element.Draw paints with rectangles, shadows, paths and text. This drawing moves with the time of each frame, which paints it again without building the page.").TextColor(t.TextMuted)
 	ui.Box(c).Height(320).Radius(10).Background(t.Surface).Draw(func(p *ui.Painter, r ui.Rect) {
-		phase := float64(c.Now().UnixMilli()%4000) / 4000 * 2 * math.Pi
+		p.AnimationFrame()
+		phase := float64(p.Now().UnixMilli()%4000) / 4000 * 2 * math.Pi
 		// Bars.
 		for i := 0; i < 12; i++ {
 			h := float32(60 + 50*math.Sin(phase+float64(i)*0.6))
@@ -1209,7 +1289,6 @@ func (g *gallery) drawing(c *ui.Context) {
 		p.FillPath(&dot, t.Accent)
 		p.Text(r.X+24, r.Y+20, "Animated at the display's rate", 14, t.Text)
 	})
-	c.AnimationFrame()
 	card(c, "Vector images", func() {
 		ui.Text(c, "SVGs stay sharp at any size: icons in the color of the text, pictures in their own colors.").TextColor(t.TextMuted)
 		gold := ui.RGB(245, 180, 0)
@@ -1228,6 +1307,88 @@ func (g *gallery) drawing(c *ui.Context) {
 			ui.Image(c, badge).Size(64, 64).TextColor(gold)
 			ui.Image(c, badge).Size(32, 32).TextColor(gold)
 		})
+	})
+}
+
+// glass shows Liquid Glass: a toolbar floating over content that scrolls
+// under it, on a bar of glass, a scroll edge or a progressive blur, a
+// tinted button, and a lens to drag around.
+func (g *gallery) glassPage(c *ui.Context) {
+	t := c.Theme()
+	ui.Text(c, "The glass plugin's Liquid Glass, a material, as macOS draws it: what is under it shows through, frosted and bent along its edges. Scroll under the toolbar, and drag the lens.").TextColor(t.TextMuted)
+	ui.Row(c).Gap(16).AlignItems(ui.Center).Wrap().Children(func() {
+		ui.Segmented(c, &g.glassStyle, "Regular", "Clear").Label("Glass")
+		ui.Segmented(c, &g.glassEdge, "Glass bar", "Soft edge", "Hard edge", "Progressive blur").Label("Under the toolbar")
+	})
+	style := glass.Regular
+	if g.glassStyle == 1 {
+		style = glass.Clear
+	}
+	tiles := []ui.Color{ui.Hex("#ef4444"), ui.Hex("#f59e0b"), ui.Hex("#10b981"), ui.Hex("#06b6d4"), ui.Hex("#6366f1"), ui.Hex("#ec4899")}
+	area := ui.Box(c).Height(420).Radius(12).Clip().Border(1, t.Border)
+	area.Children(func() {
+		// What shows through: photos and text, which start below the
+		// toolbar, 64 DIPs down, and scroll under it, with the scroll bar
+		// below what floats over the content.
+		bars := float32(64)
+		if g.glassEdge == 3 {
+			bars = 88
+		}
+		ui.Scroll(c).Fill().Padding(76, 16, 16).ScrollbarInsets(bars, 0, 0).Gap(12).Children(func() {
+			for i := range 12 {
+				ui.Row(c).Gap(14).Children(func() {
+					a, b := tiles[i%len(tiles)], tiles[(i+2)%len(tiles)]
+					ui.Box(c).Size(180, 96).Radius(12).Gradient(a, b, 135)
+					ui.Column(c).Grow(1).Gap(4).Children(func() {
+						ui.Text(c, fmt.Sprintf("Photo %d", i+1)).Bold()
+						ui.Text(c, "Glass bends the light along its rim, and frosts what is under its middle.").TextColor(t.TextMuted)
+					})
+				})
+			}
+		})
+		// A toolbar of buttons floating on glass, or over a scroll edge as
+		// macOS's, which fades the content into the background or frosts
+		// it, or over a blur, the stronger the nearer the top.
+		if g.glassEdge > 0 {
+			edge := ui.Box(c).Absolute().Top(0).Left(0).Right(0).PassThrough()
+			switch g.glassEdge {
+			case 1:
+				edge.Height(74).Material(glass.ScrollEdge{})
+			case 2:
+				edge.Height(64).Material(glass.ScrollEdge{Hard: true})
+			case 3:
+				edge.Height(88).Material(glass.Blur{Radius: 6, Mask: &ui.LinearGradient{From: ui.RGB(0, 0, 0), To: ui.Transparent, Angle: 180, Start: 0.3, End: 1}})
+			}
+		}
+		bar := ui.Row(c).Absolute().Top(12).Left(12).Right(12).Padding(6, 8).Gap(6).AlignItems(ui.Center).Radius(26)
+		if g.glassEdge == 0 {
+			bar.Material(glass.Glass{Style: style})
+		} else {
+			bar.PassThrough()
+		}
+		bar.Children(func() {
+			for _, ic := range []*ui.SVG{chevronIcon, starIcon, checkIcon} {
+				b := ui.Box(c).Size(40, 40).Radius(20).Center().Material(glass.Glass{Style: style, Interactive: true}).Children(func() {
+					ui.Icon(c, ic).FontSize(18)
+				})
+				if b.Clicked() {
+					c.Toast("Clicked")
+				}
+			}
+			ui.Box(c).Grow(1)
+			done := ui.Row(c).Padding(8, 16).Radius(20).Material(glass.Glass{Style: style, Tint: t.Accent, Interactive: true}).Children(func() {
+				ui.Text(c, "Done").Bold().TextColor(t.AccentText)
+			})
+			if done.Clicked() {
+				c.Toast("Done")
+			}
+		})
+		// A lens to drag over what is under it.
+		lens := ui.Box(c).Absolute().Left(g.lens[0]).Top(g.lens[1]).Size(110, 110).Radius(55).Material(glass.Glass{Style: style, Interactive: true})
+		if dx, dy, ok := lens.Dragged(); ok {
+			g.lens[0] = max(0, g.lens[0]+dx)
+			g.lens[1] = max(0, g.lens[1]+dy)
+		}
 	})
 }
 
@@ -1280,14 +1441,18 @@ func (g *gallery) motion(c *ui.Context) {
 			// between the rows come with the column.
 			ui.Column(c).Radius(8).Border(1, t.Border).Clip().Dividers(1, t.Border).
 				Transition(ui.ElementTransition{Size: true, Duration: itemMotion.Duration, Ease: itemMotion.Ease}).Children(func() {
+				removed := -1
 				for _, it := range g.items {
 					ui.Row(c).Key(it.id).Padding(8, 10).Gap(10).AlignItems(ui.Center).Background(t.Background).Transition(itemMotion).Children(func() {
 						ui.Box(c).Size(10, 10).Radius(5).Background(motionColors[it.id%len(motionColors)])
 						ui.Text(c, it.name).Grow(1)
 						if ui.Button(c, "Remove").Clicked() {
-							g.items = slices.DeleteFunc(g.items, func(o motionItem) bool { return o.id == it.id })
+							removed = it.id // once the loop over the items is done
 						}
 					})
+				}
+				if removed >= 0 {
+					g.items = slices.DeleteFunc(g.items, func(o motionItem) bool { return o.id == removed })
 				}
 			})
 			if len(g.items) == 0 {
@@ -1405,7 +1570,7 @@ func (g *gallery) overlays(c *ui.Context) {
 }
 
 func main() {
-	g := &gallery{router: ui.NewRouter("/overview"), items: []motionItem{{1, "Item 1"}, {2, "Item 2"}, {3, "Item 3"}}, nextItem: 3, size: "Medium", fruit: "Apple", plan: "Pro", volume: 35, picked: -1, starred: map[int]bool{}, split: 160, copies: 1, tree: map[string]bool{"ui": true}, birthday: time.Date(1815, 12, 10, 0, 0, 0, 0, time.UTC), now: time.Now(), font: "Helvetica", tags: []string{"go", "native"}, sections: [3]bool{true}, sectionsOpen: [2]bool{true, true}, stars: 4, battery: 35, quality: 75, priceLow: 100, priceHigh: 350, meeting: time.Date(2026, 10, 15, 9, 30, 0, 0, time.Local), tint: ui.Hex("#2563eb"), notes: 12, notifyMail: true, pathDepth: 4}
+	g := &gallery{router: ui.NewRouter("/overview"), items: []motionItem{{1, "Item 1"}, {2, "Item 2"}, {3, "Item 3"}}, nextItem: 3, size: "Medium", fruit: "Apple", plan: "Pro", volume: 35, picked: -1, starred: map[int]bool{}, split: 160, copies: 1, tree: map[string]bool{"ui": true}, birthday: time.Date(1815, 12, 10, 0, 0, 0, 0, time.UTC), now: time.Now(), font: "Helvetica", tags: []string{"go", "native"}, sections: [3]bool{true}, sectionsOpen: [2]bool{true, true}, stars: 4, battery: 35, quality: 75, priceLow: 100, priceHigh: 350, meeting: time.Date(2026, 10, 15, 9, 30, 0, 0, time.Local), tint: ui.Hex("#2563eb"), lens: [2]float32{110, 190}, glassEdge: 1, notes: 12, notifyMail: true, pathDepth: 4}
 	mygo.App.WhenReady(func() {
 		g.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:    "MyGo UI Gallery",

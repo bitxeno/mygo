@@ -164,6 +164,9 @@ func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return
 func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
 func loseComposition(bool) bool                   { return false }
 
+// WebKitGTK creates web views with their windows.
+func failWebViews(int) bool { return false }
+
 // A Control-click is a secondary click on macOS only.
 func controlClick(*mygo.Window, float64, float64) bool { return false }
 
@@ -225,6 +228,34 @@ func glSurface(w *mygo.Window) (how string, pix []byte, width, height int, suppo
 	return how, pix, width, height, true
 }
 
+// lazyGPU makes the windows of native UI created from now on draw in
+// memory until they ask for the GPU, with MYGO_GPU=1 too.
+func lazyGPU(on bool) bool {
+	mygo.RunOnMain(func() { linux.TestLazyGL(on) })
+	return true
+}
+
+// surfaceInputLowest reports whether the input window of a window's
+// GtkGLArea is below the windows of its hidden title bar's controls.
+func surfaceInputLowest(w *mygo.Window) (ok bool) {
+	mygo.RunOnMain(func() { ok = linux.TestSurfaceInputLowest(w.NativeHandle()) })
+	return ok
+}
+
+// useGPU asks a window of native UI for the GPU, as its content does once
+// drawing in memory costs too much.
+func useGPU(w *mygo.Window) (ok bool) {
+	mygo.RunOnMain(func() { ok = linux.TestUseGPU(w.NativeHandle()) })
+	return ok
+}
+
+// surfaceOnScreen returns, as a PNG, what the display shows of a window's
+// native UI.
+func surfaceOnScreen(w *mygo.Window) (png []byte, supported bool) {
+	mygo.RunOnMain(func() { png = linux.TestSurfaceOnScreen(w.NativeHandle()) })
+	return png, true
+}
+
 // rightClick clicks (x, y) in a window showing native UI with the
 // secondary button, through XTEST.
 func rightClick(w *mygo.Window, x, y float64) (ok bool) {
@@ -249,3 +280,16 @@ func panelSemantics(*mygo.Window) (panel, key bool, supported bool) {
 }
 
 func frontmostPID() int { return 0 }
+
+// Only macOS has key-value observing.
+func observe(*mygo.Window) (func(), bool) { return nil, false }
+
+// Input methods keep the keys typed while they compose from the content
+// themselves here (GTK's filtering, IMM32's VK_PROCESSKEY), which a
+// composition the test makes up does not show.
+func pressKey(*mygo.Window, uint16, string) bool { return false }
+
+// AppKit's older accessibility API is macOS's.
+func axAttribute(*mygo.Window, string, string) (string, bool, bool, bool) {
+	return "", false, false, false
+}

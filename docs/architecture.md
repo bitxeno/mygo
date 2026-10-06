@@ -11,7 +11,9 @@ framework safely. Read it before changing anything under `internal/`.
   physical footprint on macOS (mostly AppKit/WebKit), ~62 MB with the
   processes WKWebView runs for its page, GPU and network, and idles at 0%
   CPU. A window of native UI starts no webview process: idle, a small one
-  takes 44 MB on macOS, and the counter example 52 MB on Linux. Nothing
+  takes 44 MB on macOS, and the counter example 65 to 67 MB on Linux, tiled
+  to half of a 4K display at scale 2, 15 MB of it the window's buffer,
+  without loading Mesa (122 to 155 MB with it). Nothing
   polls: all work is driven by native events or explicit wake-ups.
 - **No cgo.** Everything builds with `CGO_ENABLED=0`, so any platform can be
   cross-compiled from any machine. Native APIs are called at run time through
@@ -78,7 +80,8 @@ framework safely. Read it before changing anything under `internal/`.
 │   ├── tsgen/          TypeScript client generator
 │   ├── accelerator/    parses "CmdOrCtrl+Shift+K"
 │   ├── update/         update manifests, signatures, archives and delta updates
-│   └── e2e/            GUI tests against the real backend (MYGO_E2E=1)
+│   ├── idlemem/        measures apps' memory once idle, for the benchmarks
+│   └── e2e/            GUI tests and benchmarks against the real backend (MYGO_E2E=1)
 ├── packages/           Bun workspace (with the examples' frontends):
 │   ├── bridge/         the runtime injected into pages (→ internal/bridge/bridge.js)
 │   ├── runtime/        mygo-runtime, the npm package apps and generated clients import
@@ -207,6 +210,12 @@ purego gives three primitives, used everywhere:
   scheme handler, menu and tray targets. Only protocols that exist at run
   time are adopted (`WKScriptMessageHandler` is not registered, and WebKit
   does not need it).
+- **Overrides call super with `sendSuper`** (`sendSuperSize` for an
+  `NSSize`), naming the class they are defined in, never purego's
+  `objc.ID.SendSuper`: that resolves super from the object's class, which
+  key-value observing replaces with a generated subclass, so the override
+  would call itself until the stack overflows. `TestSuperFromDefinedClass`
+  rejects it.
 - **The web view is not the content view.** A plain `NSView` is, holding the
   web view and, with vibrancy, an `NSVisualEffectView` behind it. WebKit
   docks the inspector next to the web view in its superview; were that the
@@ -214,7 +223,11 @@ purego gives three primitives, used everywhere:
   on.
 - **Memory is managed by hand.** Objects created with `alloc`/`init` are owned
   (+1) and must be released; convenience constructors return autoreleased
-  objects. Code that creates temporary objects runs inside `withPool`.
+  objects. Code that creates temporary objects runs inside `withPool`,
+  which keeps the goroutine on its thread until it pops the pool: a pool
+  belongs to the thread that pushed it, and a goroutine other than the
+  main one, as those reading the bundle for `App.Name`, may otherwise
+  resume on another thread, where popping it crashes.
   Delegates and windows are released with `autorelease` from
   `windowWillClose:` because AppKit still uses them while closing.
 - **Blocks.** Completion handlers passed to Apple APIs are created with
@@ -272,6 +285,17 @@ purego gives three primitives, used everywhere:
   as a Wayland compositor requires; neither event reaches WebKit. Nothing
   resizes a maximized or full screen window, and a tiled one only resizes
   at the edges the window manager allows, as with GTK's own decorations.
+- `gtk_window_realize` announces server-side decorations to a Wayland
+  compositor that speaks `org_kde_kwin_server_decoration` (KWin, COSMIC,
+  Sway) for every window GTK does not decorate itself, one without
+  decorations too, and the compositor draws its title bar on it. A
+  frameless window is realized before it shows and announced client-side
+  instead (`gdk_wayland_window_announce_csd`, looked up at startup): GDK
+  keeps that for the `GdkWindow` and requests it again whenever the window
+  maps or the compositor answers with another mode, so the window gets no
+  title bar unless the compositor decorates every window. Without the
+  protocol (Mutter), or on X11, which reads the hint of
+  `gtk_window_set_decorated`, nothing decorates the window anyway.
 - A hidden title bar (`titlebar.go`) is a window without decorations whose
   web view is in a `GtkOverlay`, under a `GtkHeaderBar` for each side of
   `gtk-decoration-layout` that names window buttons. Each bar shows only
@@ -285,9 +309,10 @@ purego gives three primitives, used everywhere:
   rebuilds them. A Wayland compositor that decorates windows itself
   (`gdk_wayland_display_prefers_ssd`: the default mode of
   `org_kde_kwin_server_decoration_manager`, server on KWin, Hyprland and
-  Sway) gets no bars: GTK asks it to decorate a window without decorations
-  too, so its title bar, or a tiling compositor's lack of one, stands for
-  the buttons, whatever the layout says.
+  Sway) gets no bars: such a window keeps GTK's announcement of server-side
+  decorations, unlike a frameless one, so the compositor's title bar, or a
+  tiling compositor's lack of one, stands for the buttons, whatever the
+  layout says.
 - `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set unless the user set it, which
   avoids blank webviews on NVIDIA drivers, VMs and containers.
 - XDG desktop portal calls go through `portalCall` (`portal.go`), which
@@ -335,6 +360,12 @@ purego gives three primitives, used everywhere:
   that show native UI need none, so an app whose windows all do runs
   without WebView2. The environment and each controller are created
   asynchronously: window methods that need the webview wait in `pending`.
+  A creation that fails is tried again, three times in all, a second
+  then two apart, as Microsoft advises unless it failed with
+  `ERROR_INVALID_STATE`: under load, WebView2 fails some with `ERROR_BUSY`
+  or `CO_E_SERVER_EXEC_FAILURE`. When the webview never comes, the calls
+  that report a result (Eval, CapturePage, PrintToPDF) get the reason, as
+  later ones do: the window closed, or WebView2 could not create it.
   User data lives in `%LOCALAPPDATA%\<name>\WebView2`.
 - **Custom schemes** load from `http://<scheme>.localhost/`, which WebView2
   lets the app answer through `WebResourceRequested`. Chromium treats
@@ -746,6 +777,47 @@ build` like mygo-runtime and released with the same version.
     from Ghostty's sources and writes it). The CLI puts them into apps
     (see the CLI's resources); other programs download theirs into the
     user's cache once, which packaged apps never do.
+- **glass** is Liquid Glass for native UI, as macOS 26 and later draw it:
+  `glass.Glass`, a `ui.Material` (interactive glass builds with its
+  element, following its press with `Animate`, and paints itself grown
+  while pressed, as macOS 27's: by a fixed 1.1 DIPs left and right and
+  0.45 above and below, measured from `NSGlassEffectView`), paints a
+  shadow and an
+  effect (`glass.Effect`, see Effects under Native UI), whose parameters
+  are a pane's material in device pixels. Its shader (`glass.metal`,
+  `glass.hlsl`, `glass.glsl`, and `pixels.go` for the CPU) takes what is
+  behind the pane, blurred, sampled where the curved surface refracts it:
+  displaced toward the middle within the bezel by Snell's law through
+  Apple's squircle profile (`lens`, along `normal`), which mirrors what is
+  just inside the rim; then maps its lightness and colors (`tone`; the CPU
+  keeps its curve in a table, as its power is slow there), tints it, and
+  lights the rim by how its normal faces the light. The defaults follow
+  macOS 27's, measured from
+  `NSGlassEffectView` over test patterns; the optics follow the
+  open-source reproductions of Liquid Glass. `glass.Blur`, a backdrop
+  blur, is a second effect (`blurEffect`): what is behind the element,
+  blurred, with its alpha (the effect samples the backdrop's texels
+  itself, as the heads' `sampleBackdrop` gives no alpha), so over nothing
+  it stays transparent. Masked by a `LinearGradient`, the blur varies as
+  the gradient's alpha (`blurLevels`): the element paints levels in turn,
+  each blurring what the levels before painted (blurs add as their
+  variances do), shown where the blur wanted is above its band, by how far
+  into the band, so a level's top doubles from at most 2 pixels to the
+  blur's most and a pixel between two levels mixes their blurs. A level of
+  a square element covers only where it shows (`blurWanted`), and so
+  reads less. Bounding the levels after the first to the element, so that
+  they read no unblurred content around it, measured worse against a blur
+  varying per pixel than leaving them reading it: the repeated edge biases
+  more than what is around. A level may tone what it shows (`blurTone`:
+  saturation, an offset, an opaque color over it), which the hard style of
+  `glass.ScrollEdge`, macOS's scroll edge effect, frosts with in one
+  level; the soft style is a gradient of the background, as macOS 27's
+  replays its window's background under a mask, with no blur (measured
+  from SwiftUI's `safeAreaBar` over test patterns, its layers dumped).
+  `go generate ./plugins/glass`
+  compiles both effects' shaders ahead of time on macOS
+  (`shaders_darwin.go`) and on Windows (`shaders_windows.go`), with
+  `internal/gen`.
 
 ## Typed client generation (`internal/tsgen`)
 
@@ -990,7 +1062,8 @@ either.
 
 - **The surface.** With `platform.WindowOptions.Surface`, a backend creates
   a view MyGo draws in place of the webview: a layer-backed NSView on
-  macOS, a GtkGLArea on Linux (a GtkDrawingArea where OpenGL would not run
+  macOS, a GtkGLArea on Linux, without an OpenGL context until the content
+  asks for the GPU (a GtkDrawingArea where OpenGL would not run
   on a GPU), a child window of class `MyGoSurface` on Windows.
   `platform.Surface` gives its native handles (for a swap chain, a layer,
   or the GtkGLArea while its `render` signal draws a frame, with its
@@ -999,9 +1072,11 @@ either.
   `gdk_monitor_get_refresh_rate`, the display mode's frequency from
   `EnumDisplaySettingsW`); asks for a frame (`RequestFrame`: a
   paused `CADisplayLink`, before macOS 14 an `NSTimer` at the display's
-  rate, `gtk_widget_queue_draw`, `InvalidateRect`); presents
+  rate, `gtk_widget_queue_draw` or a tick callback of GTK's frame clock,
+  `InvalidateRect`); presents
   pixels drawn on the CPU (`PresentPixels`: a CGImage as the layer's
-  contents, cairo in the `draw` signal, `SetDIBitsToDevice` in `WM_PAINT`);
+  contents, cairo in the `draw` signal, `SetDIBitsToDevice` in `WM_PAINT`;
+  on Linux `PresentDamage` too, with what changed);
   sets the cursor; and turns the input method on and off at the caret
   (NSTextInputClient, GtkIMContext, IMM32), with the text around it, up to
   512 runes on each side (`SetTextInput`). Everything else comes through
@@ -1014,6 +1089,10 @@ either.
   `XF86Forward` on Linux, and `WM_XBUTTONUP` (taken, so that
   DefWindowProc sends no `WM_APPCOMMAND` as well), `VK_BROWSER_BACK` and
   `VK_BROWSER_FORWARD`, and `WM_APPCOMMAND`'s browser commands on Windows.
+  A key typed while the input method composes is the input method's
+  alone, as Enter choosing a candidate: on macOS `keyDown:` sends no
+  `KeyPressed` while there is marked text, as GTK's input method filters
+  such keys on Linux and IMM32 makes them `VK_PROCESSKEY` on Windows.
   Input methods name what text and compositions replace in the text
   around the caret (`Replace`, `From`, `To`): NSTextInputClient's
   replacement ranges, GtkIMContext's `delete-surrounding`, IMM32's
@@ -1045,6 +1124,28 @@ either.
   Flutter's alerts: `UiaRaiseNotificationEvent` returned `S_OK` but its
   events reached no client, unlike the provider's automation events.
   Statuses, as toasts, are polite live regions too (`LiveSetting`).
+  Widgets of an app's own set what the bases set with element methods
+  (`Checked`, `Mixed`, `Expanded`, `Value`, `Range`, `Level`,
+  `ActiveDescendant`). Menus drawn in the window are AppKit's `AXMenu`,
+  `AXMenuBar` and `AXMenuItem`, whose choice shows as
+  `AXMenuItemMarkChar` (answered through `accessibilityAttributeValue:`,
+  as `AXInvalid` is), ATK's menu, menu bar, menu item, check menu item and
+  radio menu item, and UI Automation's Menu, MenuBar and MenuItem, with
+  Toggle for the items showing a choice; headings are WebKit's
+  `AXHeading`, whose value is their level, ATK's heading with the `level`
+  attribute, and UI Automation's Text with `HeadingLevel`. A vertical
+  slider says so (`AccessVertical`: `AXOrientation`, ATK's vertical state,
+  UI Automation's Orientation). A range's step, how far the keys move
+  its value (`AccessNode.Step`), is UI Automation's SmallChange (and
+  LargeChange at least as much) and ATK's minimum increment, through
+  `get_minimum_increment`, as purego's callbacks return no floats for
+  `get_increment`; AppKit has none, and its increments go through the
+  keys. A read-only text input is
+  `AccessReadOnly`, without `ActionSetValue`. AppKit finds an element's
+  value settable when its class overrides the setter, whatever
+  `isAccessibilitySelectorAllowed:` says, so elements answer the older
+  `accessibilityIsAttributeSettable:` themselves, as AppKit would but for
+  that value: `NSAccessibilityElement` has no implementation to call.
   The rows of a `List` (list items) and a `Table` (rows) are named by
   their content and say which of all the rows they are (`PosInSet`,
   `SetSize`, the list giving its total), as only those in view are built;
@@ -1075,7 +1176,8 @@ either.
   opening URLs, context menus), so `ui` imports neither
   `mygo` nor a backend, and an app without native UI links none of it.
   `Window.Update` and `Invalidate` coalesce redraws asked from any goroutine
-  into one frame on the main thread. Page methods return `errNoPage` or do
+  into one frame on the main thread, which `Conn.Changed` asks the content
+  for, so that it builds anew. Page methods return `errNoPage` or do
   nothing.
 - **Frames.** The engine (`ui/runtime.go`) calls the view to build a frame,
   again (up to three times) when a handler changed the state while it built,
@@ -1093,6 +1195,28 @@ either.
   frame that moved one builds another for what read the old one. Frames
   happen only when asked: input, `Invalidate`, `After`, or `AnimationFrame`
   while something moves.
+  A frame asked for only by drawings that move (`Painter.AnimationFrame`,
+  `Painter.After`, as spinners and progress bars of unknown length do)
+  paints the elements of the last frame again at its own time
+  (`repaintFrame`), without building or laying out; elements out of view
+  are not painted, so they ask for none. Such a frame is asked for with
+  `redraw` set, which anything else asking for a frame clears: every event
+  of the surface, `requestFrame`, `Conn.Changed` (`Window.Update`,
+  `Invalidate`, and `After`'s timer through them) and a change of the
+  appearance. A frame of another size, or after the text system forgot
+  its layouts (`text.System.Generation`, as it lets go of fonts the
+  elements' layouts hold), builds anew all the same. The timers the last
+  frame built armed stay; `Painter.After` has a timer of its own, which
+  posts to the main thread.
+  While nothing of the window shows (`platform.OccludableSurface`: a macOS
+  window hidden, minimized or covered by other windows, whose display link
+  still ticks, at the display's rate for half a minute, then at about 40
+  Hz), what moves asks for no frame (`held`), as browsers pause the
+  animation frames of windows out of sight; changes of the state still
+  build frames, so that assistive technology and captures follow them.
+  `SurfaceShown`, sent as some of the window shows again
+  (`windowDidChangeOcclusionState:`), has a held animation go on from
+  where the time puts it.
   A frame allocates next to nothing once the view builds what it built
   before: elements come from the context's arena, the default theme is
   copied for each pass, the states that pruning frees go to new elements
@@ -1401,16 +1525,33 @@ either.
   them, by label, for its overflow menu, whose choices click them after
   the pass (`clickLater`).
 - **Overlays** (`ui/scope.go`) scope the keyboard. Committing a frame
-  notes the dialog each focusable element is in (`DialogBase`'s backdrop,
-  `flagModal`; a popover is in its anchor's), the dialog on top
-  (`engine.modal`), and moves a popover's elements after its anchor in the
-  focus order. Tab cycles the dialog on top, the focus moves into it while
-  it is outside, the window's shortcuts built outside it do not fire, and
-  the accessibility tree is the dialog and what is above it. Overlays
-  register Escape as overlay shortcuts, which the keys the focus and the
-  elements around it leave reach, the last registered (the overlay on top)
-  first. An overlay notes the focus as it opens (`openers`), which pruning
-  gives back once it is gone with the focus that was in it.
+  notes the dialog each focusable element is in (an element made `Modal`,
+  as `DialogBase`'s backdrop, `flagModal`; a popover is in its anchor's),
+  the dialog on top (`engine.modal`, and `modalLayer`, the element at the
+  top of the overlay holding it), and moves a popover's elements after its
+  anchor in the focus order. Tab cycles the dialog on top, the focus moves
+  into it while it is outside, the window's shortcuts built outside it do
+  not fire, and the accessibility tree is the dialog's layer and what is
+  above it. Overlays register Escape as overlay shortcuts
+  (`OverlayShortcut`), which the keys the focus and the elements around it
+  leave reach, the last registered (the overlay on top) first. Each element
+  built at the top of `Overlay` notes the focus as it opens (`openers`),
+  which pruning gives back once it is gone with the focus that was in it.
+  An element attached to another (`AttachTo`, which `PopoverBase` and the
+  popups of selects and comboboxes use) is that element's popover
+  (`Element.popover`, and `state.anchor` once committed): its layout
+  (`attachTo`) finds where the target will be in the window from the boxes
+  laid out before it, the scroll offsets around it, and for an inline
+  target the paragraph's layout (`laidOutBox`), so that a popover follows
+  its anchor in the frame that moves it; then it goes to the other side, or
+  the other way along the target, where that leaves the window less, and
+  moves along the target into the window (`alongTarget`). Popovers have no
+  backdrop: the engine notes what each press went down on (`downs`, for a
+  pass), and `PressedOutside` walks from there through parents, and from a
+  popover to its anchor, which keeps presses in popovers of elements inside
+  the panel, and on its anchor, inside it, as the press goes on to what is
+  under it. A select's popup keeps a backdrop taking the presses outside,
+  as the system's pop-up menus do.
 - **Context menus** (`ui/menu.go`) open in two frames. A right-click or the
   menu key marks the element, from the states of the last frame, and the
   next frame runs its `ContextMenu` function to collect a `platform.Menu`;
@@ -1424,9 +1565,59 @@ either.
   with a color, a linear gradient mixed in sRGB or Oklab, or stripes;
   shadows (blurred rounded rectangles, cut by the box casting them, as
   CSS's box-shadow is); runs of glyphs, whose masks may take a gradient
-  (paths drawn with one); images, in color or gray; and pushed and popped
-  clips. Renderers draw the whole scene each frame and retain only
-  textures. Wavy underlines are stroked paths.
+  (paths drawn with one); images, in color or gray; effects
+  (`OpEffect`); and pushed and popped clips. Renderers draw the whole
+  scene each frame and retain only textures. Wavy underlines are stroked
+  paths.
+- **Effects** (`scene.Effect`) are drawings that packages outside the
+  renderers define, as the official plugins do (the glass plugin's Liquid
+  Glass): a fragment shader for each GPU renderer, in Metal Shading
+  Language, HLSL and GLSL, which the renderer puts between a head and a
+  tail of its own (`effect.metal`, `effect.hlsl`, `effect.glsl`, after its
+  shader's common part, with `EFFECT` defined: `EffectSource`), and a twin
+  for the CPU renderer (`EffectPixels`), which must draw the same pixels.
+  An effect paints its op's shape from five float4s of parameters
+  (`EffectOp.Params`, which travel in the instance's slots fills use for
+  colors and gradients), and from its backdrop when it reads one: what
+  the operations before it painted, the area its blur reaches
+  (`scene.BackdropOf`), averaged over squares of 1, 2, 4 or 8 pixels a
+  side so that the blur stays a few texels wide, then blurred by a
+  Gaussian along rows and along columns, each step kept in 8 bits a
+  channel, as textures hold it, which the shaders sample bilinearly
+  (`sampleBackdrop`, `BackdropImage.Sample`). The renderer multiplies an
+  effect's color by its shape's coverage, the clip and the opacity.
+  Effects carry the code compiled ahead of time from what their renderer
+  makes of their shader, with its SHA-256: renderers compile the source
+  when it no longer matches, as when their head or tail changed since,
+  and an effect's tests fail then. Package `ui` gives packages a hook,
+  `Element.Material` (a `ui.Material`, built with its element when it is
+  a `MaterialBuilder`), and `Painter.Effect`, which only this module's
+  packages can call, since effects are internal types. An effect's shape
+  has continuous corners where its op does, which the renderer covers as
+  such, while the effect gets positive radii and takes them as circular.
+- **Corners.** On macOS, rounded corners are continuous, as AppKit's and
+  SwiftUI's (`scene.Op.Continuous`), and drawn as Core Animation draws
+  them on screen, with the function of its shaders (QuartzCore's
+  `supercircle_sdf`), which differs from the Béziers of SwiftUI's paths
+  by up to half a percent of the radius: a quarter circle around the
+  diagonal that bends less and less toward the edges, which it meets
+  1.528665 radii from the corner, a quartic of the ratio of the point's
+  coordinates in the box of the curve. On sides too short for both
+  corners' curves, the curves blend toward quarter circles by the side's
+  clamp factor, from the side's length over its corners' mean radius, so a
+  circle's corners are quarter circles; a shape is the intersection of its
+  corners', so a curve may reach past the middle of a side whose other
+  corner is smaller; and edges are antialiased as Core Animation does, by
+  the value over the sum of its derivatives (`internal/raster/corner.go`).
+  Against captures of layers on screen, every pixel is within 1/255 for
+  corners that fit and for circles, and within 6/255 for pills and other
+  short sides at the sizes of controls. The CPU's renderer finds where a
+  curve crosses a row by regula falsi between the quarter circles of the
+  radius and of the curve's extent, and keeps the rows' spans of a clip
+  with continuous corners for the operations within it; a whole frame of
+  `BenchmarkFrame` takes a fifth longer. Elsewhere corners are circular,
+  as Windows and GTK draw them, and only the CPU's renderer and Metal's
+  draw continuous ones.
 - **Text.** `internal/text` lays out text with the system's own text stack,
   behind a small `engine` interface: DirectWrite on Windows
   (`IDWriteTextLayout`, with an `IDWriteTextRenderer` implemented in Go
@@ -1498,7 +1689,10 @@ either.
     (`System.GlyphRun`): their coverage added and clamped, cached as one
     bitmap.
   Paths drawn with
-  `Painter` are masks in the coverage atlas, rasterized by `internal/vec`.
+  `Painter` are masks in the coverage atlas, rasterized by `internal/vec`,
+  cached by their shape relative to the pixel grid in quarters of a pixel,
+  to which their points move first: a path looks the same whichever path
+  of its key drew its mask first.
   So are icons: `internal/svg` parses SVG documents (with `encoding/xml`
   and its own small CSS cascade) into nodes of paths, paints and layers,
   and draws them on the CPU with `internal/vec`, compositing gradients,
@@ -1547,7 +1741,20 @@ either.
   shader that computes the signed distance to rounded rectangles, Evan
   Wallace's blurred rounded box, gradients, stripes, the dashes of borders,
   atlas coverage and the innermost rounded clip; outer clips are scissor
-  rectangles. Near square corners, coverage is exact, the area of a pixel
+  rectangles. An effect draws in a batch of its own, with a pipeline of
+  its own, which the renderer makes the first time the effect draws; one
+  reading its backdrop draws after a backdrop step (`Builder.Backdrops`):
+  the renderer ends its pass, reads the backdrop's area of what it drew
+  (Metal from the drawable, which is not `framebufferOnly`; Direct3D 11
+  and OpenGL from a copy of the area, `CopySubresourceRegion` and
+  `glCopyTexSubImage2D`, whose rows go up), averages and blurs it with two
+  small pipelines (`down` and `blur`, scissored to the texels they
+  compute, reading them with `Load`, `read` or `texelFetch`) into textures
+  as large as the frame's largest backdrop, and goes on with the pass, the
+  backdrop bound for the effect. Each renderer draws scenes offscreen for
+  the tests of packages defining effects (`RenderOffscreen`,
+  `NewOffscreen`).
+  Near square corners, coverage is exact, the area of a pixel
   inside the box, so lines thinner than a pixel cover as much as they
   should, as text decorations need. A fill's border widths travel in its
   texture rectangle, which fills do not use, and a glyph's gamma ratios
@@ -1599,7 +1806,28 @@ either.
     the GPU did, and presents it, with no command buffer: the driver
     allocates its 32 to 44 MB only for frames that run on the GPU, and the
     CPU draws a small change in a fraction of the time the GPU takes to
-    start. Its drawables are not `framebufferOnly` for that;
+    start. Its drawables are not `framebufferOnly` for that. Colors
+    outside the sRGB gamut (`ui.Oklch`, as CSS's `oklch()`) are in a
+    table of the scene (`scene.Scene.Wide`), which ops and glyphs point
+    into with a 16-bit index (`Op.Wide`, in room the op's other fields
+    leave); their `Color`, `Color2` and `BorderColor` hold the nearest
+    sRGB colors, found as CSS Color 4 does (`internal/gamut`), which the
+    CPU, OpenGL and Direct3D renderers draw, as `gpu.Builder` does unless
+    `Wide`. The window host decides when a window draws them
+    (`wideHold`): on a screen showing more than sRGB
+    (`platform.WideGamutSurface`, `canRepresentDisplayGamut:` on macOS),
+    from a frame with some until none came for two seconds, so that a
+    blinking caret does not switch formats at every blink; those frames
+    are the GPU's, and a window on an sRGB screen keeps drawing the
+    nearest colors on the CPU. The Metal renderer (`SetWide`) then
+    switches the layer to `RGBA16Float` in the extended sRGB color space,
+    which keeps components outside 0 to 1 and which the system shows in
+    the display's gamut, and draws with pipelines and backdrop textures
+    of that format, made the first time. A uniform of the frame (the z of
+    the vertex and fragment globals) tells the shaders: Oklab gradients
+    then keep what their mix has outside sRGB, and effects read it as
+    `e.wide`, as the glass does to take its tint in extended sRGB
+    (`ui.Painter.EffectColor`);
   - `internal/gpu/gl` with the shader in GLSL 3.30 or GLSL ES 3.00, which
     the driver compiles when the renderer starts, since these versions
     have no compiled form every driver takes, and drivers keep what they
@@ -1611,17 +1839,27 @@ either.
     else OpenGL ES 3.0, as GPUs with OpenGL ES alone have, and so does
     the probe below (`glContext`).
 
-  Linux draws with OpenGL only where it runs on a GPU: the backend makes
-  one context, on a window that never shows, when the first surface is
-  created, and reads its renderer. A software renderer such as Mesa's
-  llvmpipe (in virtual machines, in WSL without `GALLIUM_DRIVER=d3d12`)
-  redraws every pixel of every frame on the CPU, ten times the CPU
-  renderer's work on an animated page; and once a window has a GL context
-  GTK composites it with OpenGL, so the choice is made before any surface
-  has one; `MYGO_GPU=1` skips it and draws with OpenGL wherever GDK makes a
-  context, as the GUI tests of CI do on llvmpipe. The context loads Mesa
-  for good, about 20 MB, so the devices answer first where they can: no
-  probe without NVIDIA's devices or a render node of a DRM driver with 3D
+  Linux draws with OpenGL only where it runs on a GPU, and only once a
+  window needs it. A GL context loads Mesa for good: some 50 MB of
+  libraries (LLVM, which distributions' Mesa links, takes 19 MB as it
+  loads), its threads and heap, as much as the rest of a small app. So a
+  surface's GtkGLArea makes no context until the content asks for the GPU
+  (`platform.LazyGPUSurface`): its `create-context` handler stops the
+  signal, as GTK's own handler would make one, and the area paints frames
+  drawn in memory with cairo, in a window GTK paints without OpenGL.
+  `UseGPU` realizes the area anew, which makes the context, moving the
+  input method's focus with it, and lowers the area's new input window
+  under a hidden title bar's controls, which mapping it raised it over.
+  Before that, the backend makes one context,
+  on a window that never shows, and reads its renderer. A software
+  renderer such as Mesa's llvmpipe (in virtual machines, in WSL without
+  `GALLIUM_DRIVER=d3d12`) redraws every pixel of every frame on the CPU,
+  ten times the CPU renderer's work on an animated page; and once a window
+  has a GL context GTK composites it with OpenGL, so the choice is made
+  before any surface has one; `MYGO_GPU=1` skips it and draws with OpenGL
+  wherever GDK makes a context, from the first frame, as the GUI tests of
+  CI do on llvmpipe. The devices answer first where they can: no GtkGLArea
+  without NVIDIA's devices or a render node of a DRM driver with 3D
   (simpledrm, bochs, VirtualBox's or Hyper-V's only show what the CPU
   drew), nor on WSL's device without `GALLIUM_DRIVER=d3d12`. A GtkGLArea shows only
   what OpenGL draws into it: when its GL renderer fails all the same, the
@@ -1630,24 +1868,92 @@ either.
 
   `internal/raster` draws the same scene with the same formulas on the CPU,
   solid spans inside shapes and only the edges of shadows computed, and
-  redraws only what differs from the last scene (`raster.Renderer`): it is
-  the renderer of tests, of `MYGO_GPU=0` and of Linux without a GPU, and
-  the one a window falls back to when its GPU renderer fails. Frames that
-  are not the surface's (a capture before the first frame) are kept, not
-  drawn: OpenGL's context is current only in the surface's.
+  redraws only what differs from the last scene (`raster.Renderer`), with
+  the effects reading their backdrops that meets and those backdrops, in
+  rectangles apart from each other (`addBackdrops`): it is
+  the renderer of tests, of `MYGO_GPU=0` and of Linux until a window needs
+  the GPU, and the one a window falls back to when its GPU renderer fails.
+  Frames that are not the surface's (a capture before the first frame) are
+  kept, not drawn: OpenGL's context is current only in the surface's. An
+  area drawn goes through the operations whose bounds (those the damage is
+  found from) it meets; a large one is drawn on up to eight cores, in
+  bands of 64 rows that each takes in turn, as rows differ in how much
+  they draw, each pixel as drawing the area whole gives it. An effect is
+  readied (`EffectPixels.Begin`) before its pixels, and one reading its
+  backdrop reads pixels other bands draw, so an area is drawn up to each
+  effect, its backdrop computed (`backdrop.read`, its rows and columns on
+  several cores too), then from the effect to the next, in bands of 16
+  rows, as effects are costly and often short. The glass plugin's
+  `BenchmarkGlass`, a window of 1360×720 pixels with four panes, takes
+  6.4 ms drawn whole on an M5, 22 ms on one core. A whole frame
+  of `BenchmarkFrame`'s view at 1844×2044 pixels, built and drawn, takes
+  0.7 ms rather than 3.2 on a Ryzen 7 8745HS: memory bandwidth and the
+  lower clock of all cores keep it from scaling further.
+
+  On Linux, `RequestFrame` of a surface drawing in memory adds a tick
+  callback to the area, which GTK's frame clock runs in its update phase,
+  before painting: the frame is drawn there, and `PresentDamage` keeps its
+  pixels and asks GTK to repaint what changed (`gtk_widget_queue_draw_area`),
+  which the `draw` signal paints from them in the same frame. GTK keeps
+  the rest of its buffer, copying it from the last one into a new buffer
+  when the compositor still holds the last, and tells the compositor
+  only that changed: a digit of the counter copies 24 KB of pixels instead
+  of 15 MB for half of a 4K display, in 0.01 ms instead of 1. A draw GTK
+  asks for by itself, as a resize does, draws a frame in the `draw`
+  signal, and repaints in the next frame what it changed outside GTK's
+  clip.
 
   Where the GPU renderer presents frames drawn in memory (Metal's), the
   window host draws on the CPU the frames that change little, measuring
-  first what `raster.Renderer` would redraw (`Changes`): a frame after a
-  pause of 50 ms or more, unless it redraws more than 8 million pixels,
-  and in a burst of frames one that redraws at most a sixteenth of the
-  window: clocks, typing, the pointer over a button, a progress bar.
-  Scrolling, resizing and animations of much of the window draw on the
-  GPU, and the next frame after a pause catches up on the CPU. Once the
-  GPU has drawn alone for a second, the host frees the CPU's frame. The
+  first what `raster.Renderer` would redraw and what changed since the
+  frame before (`Changes`): a frame after a pause of 50 ms or more, unless
+  it redraws more than 8 million pixels, and in a burst of frames one that
+  changes at most a sixteenth of the window: clocks, typing, the pointer
+  over a button, a progress bar. Scrolling, resizing and animations of
+  much of the window draw on the GPU, whose scenes the CPU's renderer
+  notes (`Skip`) to compare the next with, and redraws where its frame no
+  longer shows them: the first frame changing little draws on the CPU
+  again, catching up, so that a progress bar moving on after a page slid
+  in draws on the CPU though its frames never pause. Once the GPU has
+  drawn alone for a second, the host frees the pixels of the CPU's frame,
+  which keeps the scene to compare with (`ReleaseImage`) and draws whole
+  next. Frames that change little may still cost the CPU much, as an
+  animation repainting translucent layers over gradients and shadows at
+  the display's rate: the host measures the CPU's frames of each burst as
+  it does those of a lazy surface below (`cpuLoad`, `noteCPUFrame`), and
+  once they take more than a quarter of a burst lasting 250 ms or more,
+  the rest of the burst draws on the GPU, which Metal does in a millisecond
+  or two of the CPU's time; a pause of 50 ms after the last frame was done
+  starts a burst on the CPU again. A dot pulsing at 60 Hz in the headers of
+  a terminal's translucent panes took 4.0 to 4.5 CPU seconds over 10 s on
+  the CPU, and 1.5 to 1.8 this way. A frame the CPU draws that changes
+  nothing presents nothing. The
   gallery, which updates once a second, takes 0.2 to 0.4% of a core and
   67 to 77 MB on macOS this way, against 0.4 to 0.5% and 110 to 116 MB on
   the GPU alone.
+
+  On a surface that gives the GPU on demand (Linux's), the host measures
+  how long drawing and presenting each frame in memory takes, over bursts
+  of frames each begun within 50 ms of the last one's end (`cpuLoad`),
+  however long they take. Once that is more than a quarter of a burst
+  lasting 250 ms or more, as scrolling or animating much of a large window
+  may on a slow CPU or a fast display, it asks for the GPU when the window
+  has been idle for 250 ms, so that loading the driver delays no frame, or
+  at once, after the frame, when the burst goes on for a second or its
+  frames take longer than a refresh of the display (`noteCPU`). The next
+  frame makes the GPU renderer; a surface without one to give is not asked
+  again. A whole frame of a window 1834×2044 pixels takes 3.4 ms on a
+  Ryzen 7 8745HS, so it stays in memory there at 60 Hz.
+
+  Two seconds after the last frame (`frameIdle`), the host frees the frame
+  drawn in memory, as large as the window, which the next frame draws whole,
+  and tells the surface it is idle (`platform.IdleSurface`): Linux's calls
+  glibc's `malloc_trim`. GTK paints a window it composites with OpenGL into
+  an image as large as what it repaints, the whole window for a whole
+  frame, and glibc, raising its
+  threshold for giving large blocks back as they are freed, kept one or two
+  of them, 15 to 30 MB for half of a 4K display. These timers run on the
+  main thread through `surface.Conn.Post`.
 
   A GPU renderer that fails (a driver reset, a GPU unplugged, sleep) is
   released and another made in the same frame (`ui/window.go`): the GPU
@@ -1743,7 +2049,9 @@ renderer's (`gputest.Compare`).
     the platform directories of other platforms. Frontend sources
     are the dev server's business and never rebuild the app. A build keeps
     the watcher's baseline unless it changed what is watched, so edits made
-    during a build trigger another one.
+    during a build trigger another one. On Windows the watcher opens
+    directories sharing them for deletion (`openDir`), which `os.Open`
+    does not, so that deleting or renaming one it lists does not fail.
   - Quitting the app ends `mygo dev`; a crash waits for the next change.
 - `build` generates the client, runs `buildCommand`, then compiles each
   target with `-trimpath -ldflags "-s -w -X …production=1"` (`-H=windowsgui`
@@ -1808,7 +2116,12 @@ renderer's (`gputest.Compare`).
   menu shortcut, a desktop shortcut that the finish page's second check
   box (MUI's "show readme" one) creates, and an uninstaller registered
   under `HKCU\…\Uninstall\<identifier>`; `/S /D=<dir>` installs
-  silently, without the desktop shortcut.
+  silently, without the desktop shortcut. The uninstaller runs from a
+  copy of itself that nothing waits for, so it removes the app's folder
+  last: the folder is gone once the uninstall is done. It tries deleting
+  each shortcut again for up to 5 s, as Explorer opens a new shortcut a
+  few seconds after it appears, not sharing it for deletion, and `Delete`
+  fails meanwhile.
   `makensis` comes from an installation of NSIS or, on Windows, where NSIS
   is rarely installed, from the official zip of the release `nsisRelease`
   pins, which the CLI downloads once, checks against its SHA-256 and
@@ -1886,7 +2199,7 @@ profile).
 | runtime | `bun run test` | the injected runtime, `mygo-runtime` and the plugins' packages (against a fake Go side on the real runtime, `plugins/fake-go.ts`) |
 | plugins | `go test ./plugins/...` | the fetch plugin against `httptest` servers, the WebSocket client against a test server (ordering, fragments, pings, closing handshakes); the terminal's binding of libghostty-vt (layouts, rendering, encoders, selections), its pseudo-terminals, and its view through `Tester` with real shells: typing, keys as programs ask, input methods, mouse reports, selecting and copying, pasting, scrollback, exits (the library is downloaded, or named by `MYGO_GHOSTTY_VT`; `-short` skips them) |
 | native UI | `go test ./ui ./internal/text ./internal/scene ./internal/raster ./internal/svg ./internal/gpu/...` | the GPU renderers against the CPU renderer (Direct3D on Windows, Metal on macOS, OpenGL on Linux); views through `Tester`: input, focus, editing, lists, overlays, frames that fill the glyph atlas; text layout and caret geometry; atlas zones and repacking; the CPU renderer against its formulas; SVG parsing and drawing, with `FuzzParse`; `go test -run '^$' -bench . ./ui` times a frame |
-| GUI | `MYGO_E2E=1 go test ./internal/e2e` | the real backend: IPC, channels, protocol, Eval, geometry, capture, menus, window.open, native UI (frames, clicks, input methods replacing typed text, file drops, assistive technology reading and acting; on macOS typing, skipped while an input method is selected, and composing; on Linux with `MYGO_GPU=1`, what OpenGL drew in the GtkGLArea); on Windows too (a GitHub Actions `windows-latest` runner has WebView2) |
+| GUI | `MYGO_E2E=1 go test ./internal/e2e` | the real backend: IPC, channels, protocol, Eval, geometry, capture, menus, window.open, native UI (frames, clicks, input methods replacing typed text, file drops, assistive technology reading and acting; on macOS typing, skipped while an input method is selected, and composing; on Linux with `MYGO_GPU=1`, what OpenGL drew in the GtkGLArea, from the first frame and once a window drawing in memory asks for the GPU); on Windows too (a GitHub Actions `windows-latest` runner has WebView2) |
 
 The XDG variables let the URL scheme test check that GLib opens the scheme
 with the handler it registered; without them it writes to temporary
@@ -1920,6 +2233,76 @@ the test binary's app ID. It passes on Debian 13 (portal 1.20, Plasma 6.3)
 and Debian 12 (portal 1.16, Plasma 5.27); Ubuntu 24.04 (portal 1.18, Plasma
 5.27) binds no shortcuts for any app.
 
+### Benchmarks
+
+`.github/workflows/bench.yml` measures every push to main on GitHub's
+macOS, Linux and Windows runners, and the website shows the results at
+[/benchmarks](https://mygo.egoist.dev/benchmarks). `scripts/bench.ts`
+runs them:
+
+```sh
+bun scripts/bench.ts run                 # every package's Go benchmarks, and app sizes
+bun scripts/bench.ts run --e2e           # internal/e2e's too, in a desktop session
+bun scripts/bench.ts run ./ui --count 3  # one package, fewer runs
+```
+
+It finds the packages with benchmarks and runs them one at a time
+(`-p 1`), each benchmark six times for half a second (`-count 6
+-benchtime 500ms`), and keeps the median of each metric: `ns/op`,
+`B/op`, `allocs/op` and those a benchmark reports; `MB/s` follows from
+`ns/op`. It also builds `examples/hello` and `examples/counter-native` as
+`mygo build` builds a release, without resources, and records their size,
+and with `--e2e` their memory six seconds after they start
+(`go run ./internal/idlemem app...`, as many times as `--count`): an
+app's process with the processes it runs, and `hello`'s own as
+`hello/app`. Memory is what each platform shows: the physical footprint
+on macOS, the proportional set size on Linux, the private working set on
+Windows. On macOS a bare executable's WebKit processes belong to the
+process responsible for it (the terminal, or the runner), so idlemem
+counts those that started with the app and share its responsible
+process. GitHub's runners are virtual machines with a 1024×768
+display at scale 1: there, counter-native's footprint is 22 MB on macOS,
+where an M5 MacBook with a Retina and a 4K display gives 37 MB, AppKit's
+own allocations taking half (`footprint -p <pid>` breaks it down); on
+Windows its private working set is 14 MB, of a working set of 39 MB with
+the pages it shares, and 62 MB committed. Compare a series with itself.
+`--out` writes the results as JSON, with the commit and the runner's CPU.
+The benchmarks of `internal/e2e` time the real backend: a page calling Go
+(`PageCall`, `PageCallItems`), streaming (`PageChannel`), receiving events
+(`PageEvent`), fetching from the app's scheme (`PageFetch1MB`), and
+windows opening until their DOM is ready or their native UI has built a
+frame (`WindowOpen`, `ContentWindowOpen`).
+
+The workflow's last job merges the results into the `benchmarks` branch
+(`bun scripts/bench.ts merge`): `history/<yyyy-mm-dd>.json` keeps every
+commit measured that day, a line each, and `latest.json` the last 300
+commits by series, which the page fetches from raw.githubusercontent.com
+when it opens, so results show without a deploy. Its commits say
+`[skip ci]`, which Cloudflare's builds of the website honor too, and a
+push that races another run's merges again onto it. Started by hand with a
+`ref`, the workflow measures that commit with the current script, to fill
+in history.
+
+The page finds the commits that moved each series (`findSteps` in
+`website/src/lib/benchmarks.ts`): a commit whose value, and the median of
+the five from it, differ from the median of the five before by more than
+the series' noise, five median absolute deviations of the twenty before
+(their range while fewer than fifteen; at least 5% for time, 1% for
+memory and allocations, 0.2% for sizes, and 16 bytes or an allocation).
+After a step, the values before it are left behind. A series that moves
+needs ten values before a step and two commits after it; a steady one,
+as allocations mostly are, five and none. Charts mark steps with ▲ and ▼,
+the summary lists the commits shown that moved results, and a card
+compares the last value with the first ones shown, so that a regression
+stays in sight after later commits. GitHub's runners get one of several
+CPUs from run to run (Windows' EPYC 9V74 runs some benchmarks 40% faster
+than the 7763), so timings are compared only among commits measured on
+the same CPU, and their charts draw the last commit's CPU as the line and
+others in gray.
+
+Benchmarks are described on the page by their doc comments, which the
+site reads when it is built: start them with the benchmark's name.
+
 ## Releasing
 
 The Go module, the CLI and the npm packages share one version:
@@ -1931,11 +2314,12 @@ git commit -am "Release 0.2.0" && git tag v0.2.0 && git push origin main v0.2.0
 
 The tag starts `.github/workflows/release.yml`, which checks that the tag
 matches the versions (`bun scripts/version.ts --check`) and runs
-`bun scripts/publish.ts --provenance`: it builds the CLI's binaries and
-publishes mygo-runtime and the platform packages, then mygo-cli once npm
-serves them to package managers, skipping versions already on npm,
-prereleases under the `next` dist-tag. npm can take minutes to serve new
-packages, and a package manager installs mygo-cli without a platform
+`bun scripts/publish.ts --provenance`: it publishes mygo-runtime and the
+plugins' packages while it builds the CLI's binaries, each platform package
+once its binary is built, then mygo-cli once npm serves them to package
+managers, skipping versions already on npm, prereleases under the `next`
+dist-tag. npm serves a package minutes after accepting it ("Your package
+is being processed"), and a package manager installs mygo-cli without a platform
 package it cannot fetch; bun then keeps that package out while its lockfile
 lacks it, even with `--force`. The workflow then asks the Go module proxy
 for the tag and creates the GitHub release.
@@ -1999,7 +2383,8 @@ which npm allows only for packages that exist: the first release uses an
 | auto-hide menu bar | ignored | the bar widget hides; `can-activate-accel` keeps its shortcuts; Alt alone or F10 show it and open its first menu until it deactivates | the menu is attached only for the `SC_KEYMENU` menu loop that Alt alone or F10 start; shortcuts come from the webview |
 | tray | NSStatusItem, click events | AppIndicator (menu only, no click events) | notification area icon, click events |
 | global shortcuts | Carbon hot keys | X11: `XGrabKey` on the root window (with Caps/Num Lock variants), key presses from a GDK filter. Wayland: the XDG `GlobalShortcuts` portal (see [Linux](#linux-internallinux)) | `RegisterHotKey` |
-| notifications | UserNotifications, packaged apps only | org.freedesktop.Notifications over D-Bus | notification-area balloons (toasts) |
+| notifications | UserNotifications, packaged apps only; `Group` is the `threadIdentifier`; the delegate is attached at launch, for the click that launched the app | org.freedesktop.Notifications over D-Bus; no `Group` | notification-area balloons (toasts); no `Group` |
+| notification removal | `removeDeliveredNotificationsWithIdentifiers:`; `ClearNotifications` removes all, earlier runs' too | `CloseNotification` on the bus, for those of this run | hides the balloon, which goes away by itself anyway |
 | vibrancy | all materials | ignored | Windows 11 22H2 Mica, Acrylic, Tabbed, in windows created with a material, which have no menu bar |
 | traffic lights, Dock | yes | ignored | ignored |
 | hidden title bar | AppKit's traffic lights over a full-size content view | GTK's title buttons in header bars over the page, per `gtk-decoration-layout`; none where the Wayland compositor decorates windows | caption buttons drawn in a layered child window, through DirectComposition over a material; snap layouts; a top edge that resizes |
