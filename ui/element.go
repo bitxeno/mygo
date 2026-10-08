@@ -77,7 +77,7 @@ const (
 
 // flags of an element.
 const (
-	flagClickable uint32 = 1 << iota
+	flagClickable uint64 = 1 << iota
 	flagFocusable
 	flagEditable
 	flagDragWindow
@@ -204,7 +204,7 @@ type Element struct {
 	c      *Context
 	id     uint64
 	kind   kind
-	flags  uint32
+	flags  uint64
 	parent *Element
 	first  *Element
 	last   *Element

@@ -738,7 +738,7 @@ type scrollGeometry struct {
 // edges by inset (top, right, bottom, left, ScrollbarInsets): those of the
 // directions its flags scroll that overflow, which leave each other the
 // corner where both show.
-func scrollBars(box Rect, inset [4]float32, w, h, x, y float32, flags uint32, width float32) scrollGeometry {
+func scrollBars(box Rect, inset [4]float32, w, h, x, y float32, flags uint64, width float32) scrollGeometry {
 	var g scrollGeometry
 	g.vertical = flags&flagScrollY != 0 && h > box.H+0.5
 	g.horizontal = flags&flagScrollX != 0 && w > box.W+0.5

@@ -372,7 +372,7 @@ type state struct {
 	x, y, w, h     float32
 	vx, vy, vw, vh float32
 	parent         uint64
-	flags          uint32
+	flags          uint64
 	cursor         Cursor
 	// tip marks an element with a tooltip (TooltipBase).
 	tip bool

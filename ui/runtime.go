@@ -254,7 +254,7 @@ type labelNode struct {
 type hit struct {
 	st    *state
 	r     Rect
-	flags uint32
+	flags uint64
 }
 
 type shortcutReg struct {
