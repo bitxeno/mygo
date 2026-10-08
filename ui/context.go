@@ -7,17 +7,22 @@ import (
 
 	"github.com/egoist/mygo/internal/scene"
 	"github.com/egoist/mygo/internal/text"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Context builds a window's user interface for one frame. The window's
 // view function receives it on the main thread; it is only valid during
-// that call.
+// that call. A frame may rebuild the view in several passes; neither a
+// Context nor its Elements may be saved for a later call.
 type Context struct {
-	rt       *engine
-	parent   *Element
-	root     *Element
-	chunks   [][]Element
-	used     int
+	rt     *engine
+	parent *Element
+	root   *Element
+	chunks [][]Element
+	used   int
+	// dirty is how many elements in the arena have held references since
+	// finish last cleared the unused ones, including earlier build passes.
+	dirty    int
 	theme    *Theme
 	now      time.Time
 	w, h     float32
@@ -50,7 +55,8 @@ type Context struct {
 	// spare are the chunks of the frame before, which the engine keeps
 	// while elements of that frame may leave with an exit transition, to
 	// copy them (engine.exitsBuilt).
-	spare [][]Element
+	spare      [][]Element
+	spareDirty int
 	// transitions are the elements given a Transition, in the order asked,
 	// and dividers those drawing lines between their children.
 	transitions []transitionUse
@@ -60,7 +66,7 @@ type Context struct {
 	depthStarts []int
 }
 
-const chunkSize = 256
+const chunkSize = 32
 
 // alloc returns a zeroed element from the frame's arena.
 func (c *Context) alloc() *Element {
@@ -81,13 +87,19 @@ func (c *Context) alloc() *Element {
 }
 
 func (c *Context) reset(now time.Time, w, h float32) {
+	c.dirty = max(c.dirty, c.used)
 	c.used = 0
 	c.now = now
 	c.w, c.h = w, h
 	c.theme = c.rt.defaultTheme()
 	c.tree = nil
+	clear(c.reveal)
 	c.reveal = c.reveal[:0]
+	clear(c.transitions)
 	c.transitions = c.transitions[:0]
+	clear(c.sortedUses)
+	c.sortedUses = c.sortedUses[:0]
+	clear(c.dividers)
 	c.dividers = c.dividers[:0]
 	c.router, c.routers, c.inert = nil, 0, false
 	root := c.alloc()
@@ -101,6 +113,33 @@ func (c *Context) reset(now time.Time, w, h float32) {
 	c.root = root
 	c.parent = root
 	c.overlay = nil
+}
+
+// finish frees references to elements left out of the frame, including
+// those from an earlier pass. Exit transitions have copied what they
+// need from the spare arena by now. Keep one empty chunk for growth, so
+// that a few rows entering and leaving a list do not allocate every frame.
+func (c *Context) finish() {
+	c.chunks = trimArena(c.chunks, c.used, max(c.dirty, c.used))
+	c.spare = trimArena(c.spare, 0, c.spareDirty)
+	c.dirty, c.spareDirty = c.used, 0
+}
+
+func trimArena(chunks [][]Element, used, dirty int) [][]Element {
+	n := (used + chunkSize - 1) / chunkSize
+	// Only elements used since the last cleanup can retain anything.
+	// Clear at most the two chunks kept; the rest give up their storage.
+	for i, end := used, min(dirty, (n+1)*chunkSize); i < end; {
+		ci, ei := i/chunkSize, i%chunkSize
+		to := min(chunkSize, end-ci*chunkSize)
+		clear(chunks[ci][ei:to])
+		i = ci*chunkSize + to
+	}
+	if n < len(chunks) {
+		clear(chunks[n+1:])
+		chunks = chunks[:n+1]
+	}
+	return chunks
 }
 
 // overlayID is the ID of the layer of overlays.
@@ -398,7 +437,12 @@ type state struct {
 	droppedValue any
 	hasDropped   bool
 	dropX, dropY float32
+	dataSource   *dataSource
+	dataTarget   *transfer.DropOptions
+	dataDropped  *transfer.Drop
 	editor       *editor
+	// textScope is the Selectable container this paragraph belongs to.
+	textScope uint64
 	// spans keeps what a text made of its spans in the last frame.
 	spans     *spanCache
 	locals    map[any]any
@@ -408,9 +452,11 @@ type state struct {
 
 	// input, caret and takesText are those of the last frame's element
 	// (HandleInput, TextCaret).
-	input     func(InputEvent) bool
-	caret     Rect
-	takesText bool
+	input       func(InputEvent) bool
+	textClient  TextInputClient
+	textAdapter *textInputAdapter
+	caret       Rect
+	takesText   bool
 	// scope is the dialog the element was in, 0 for none, and anchor the
 	// element it was a popover of (AttachTo, PopoverBase).
 	scope, anchor uint64
@@ -438,7 +484,9 @@ func (rt *engine) lookState(id uint64) (s *state, built bool) {
 	if s == nil {
 		if n := len(rt.free); n > 0 {
 			// A state pruned, which nothing refers to any more.
-			s, rt.free = rt.free[n-1], rt.free[:n-1]
+			s = rt.free[n-1]
+			rt.free[n-1] = nil
+			rt.free = rt.free[:n-1]
 			*s = state{id: id, born: rt.frame}
 		} else {
 			s = &state{id: id, born: rt.frame}
@@ -450,6 +498,7 @@ func (rt *engine) lookState(id uint64) (s *state, built bool) {
 	s.seen, s.pass = rt.frame, rt.pass
 	// What the element drags and takes, as this pass asks.
 	s.dragValue, s.dragFn, s.accepts = nil, nil, nil
+	s.dataSource, s.dataTarget = nil, nil
 	return s, built
 }
 

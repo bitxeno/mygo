@@ -13,6 +13,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/egoist/mygo/transfer"
 )
 
 // ErrUnsupported is returned by features the current backend cannot provide.
@@ -389,6 +391,9 @@ type WindowHandler interface {
 	Closed()
 	Focused()
 	Blurred()
+	// MenuItemClicked reports an item chosen from this window's menu bar
+	// or context menu, even while the menu has focus instead of the window.
+	MenuItemClicked(id int)
 	Resized()
 	Moved()
 	Minimized()
@@ -586,6 +591,18 @@ type Dialogs interface {
 
 // Clipboard accesses the system clipboard.
 type Clipboard interface {
+	// Data reads copy accepted representations, so returned data outlives
+	// native ownership. Nil formats reads all; a missing explicit match is
+	// transfer.ErrFormat. WriteData takes an application-owned snapshot;
+	// released runs once when native providers are no longer needed, never
+	// after a failed write. Neither operation depends on a source window.
+	ReadData(formats []transfer.Format) (transfer.Data, error)
+	WriteData(data transfer.Data, released func()) error
+	Formats() []transfer.Format
+	// Flush materializes owned providers and asks the system to persist the
+	// data. Close drops any remaining owned providers at app shutdown.
+	Flush() error
+	Close()
 	ReadText() string
 	WriteText(text string)
 	ReadHTML() string

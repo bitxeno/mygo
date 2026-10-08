@@ -129,6 +129,8 @@ const (
 	// flagDividers marks an element drawing lines between its children,
 	// listed in Context.dividers.
 	flagDividers
+	// flagUnselectable excludes text from a surrounding Selectable container.
+	flagUnselectable
 
 	// flagClip clips both ways.
 	flagClip = flagClipX | flagClipY
@@ -162,6 +164,8 @@ type textStyle struct {
 	decoColor  Color
 	decoThick  float32
 	background Color
+	// selection is the highlight of selected text, the theme's when unset.
+	selection Color
 }
 
 const (
@@ -179,9 +183,10 @@ const (
 	setDecoColor
 	setDecoThick
 	setBackground
+	setSelection
 
 	// setAll has every bit of textStyle.set.
-	setAll = setBackground<<1 - 1
+	setAll = setSelection<<1 - 1
 )
 
 // Element is a node of a frame's user interface. The functions that create
@@ -190,7 +195,11 @@ const (
 //
 //	ui.Text(c, "Hello").FontSize(20).Bold()
 //
-// An element only lives during the frame that built it.
+// An element only lives during the build pass that created it. Do not keep
+// it in app state: a later pass may clear or reuse its storage for another
+// element. For a list's focus and shortcuts, keep its ListState instead.
+// Common input queries return false or zero for nil or cleared elements;
+// this does not make references to reused storage safe.
 type Element struct {
 	c      *Context
 	id     uint64
@@ -247,9 +256,10 @@ type Element struct {
 
 	// Input the element takes itself (HandleInput), and where the caret of
 	// the text it takes is (TextCaret).
-	inputFn   func(InputEvent) bool
-	caret     Rect
-	takesText bool
+	inputFn    func(InputEvent) bool
+	textClient TextInputClient
+	caret      Rect
+	takesText  bool
 
 	// Content.
 	text     string
@@ -898,6 +908,23 @@ func (e *Element) Font(family string) *Element { e.ts.family = family; e.ts.set 
 // TextColor sets the color of text.
 func (e *Element) TextColor(c Color) *Element { e.ts.color = c; e.ts.set |= setColor; return e }
 
+// SelectionColor sets the highlight of selected text in the element and
+// the text inside it, as text on a colored bubble needs one that shows
+// on it; the theme's Selection is the highlight elsewhere.
+func (e *Element) SelectionColor(c Color) *Element {
+	e.ts.selection = c
+	e.ts.set |= setSelection
+	return e
+}
+
+// selectionColor is the highlight of the style's selected text.
+func (ts *textStyle) selectionColor(t *Theme) Color {
+	if ts.set&setSelection != 0 {
+		return ts.selection
+	}
+	return t.Selection
+}
+
 // LineHeight sets the height of lines of text as a multiple of the font
 // size.
 func (e *Element) LineHeight(m float32) *Element {
@@ -1023,7 +1050,15 @@ func (e *Element) IsDisabled() bool {
 // disabled reports whether the element is disabled, or was in the last
 // frame, which the input since acted on: an element around it may disable
 // it after building it.
-func (e *Element) disabled() bool { return e.IsDisabled() || e.st.flags&flagDisabled != 0 }
+func (e *Element) disabled() bool {
+	return !e.hasState() || e.IsDisabled() || e.st.flags&flagDisabled != 0
+}
+
+// hasState lets input queries treat nil and cleared elements as absent.
+// It cannot recognize an old pointer whose arena slot has been reused.
+func (e *Element) hasState() bool {
+	return e != nil && e.c != nil && e.c.rt != nil && e.st != nil && !e.c.rt.closed
+}
 
 // Focusable lets the element take the keyboard focus, by a click or Tab.
 func (e *Element) Focusable() *Element { e.flags |= flagFocusable; return e }
@@ -1063,6 +1098,9 @@ func (e *Element) ID() uint64 { return e.id }
 // Bounds returns the element's box in the previous frame, in DIPs relative
 // to the window; it is empty for an element the previous frame lacked.
 func (e *Element) Bounds() Rect {
+	if !e.hasState() {
+		return Rect{}
+	}
 	s := e.st
 	return Rect{s.x, s.y, s.w, s.h}
 }
